@@ -1,14 +1,11 @@
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
-const { GoogleGenAI } = require('@google/genai');
 const express = require('express');
 const QRCode = require('qrcode');
 const pino = require('pino');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-
-// Gemini API Başlatma
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
 let latestQR = '';
 let isConnected = false;
@@ -29,6 +26,31 @@ Görevlerin:
 3. Gereksiz uzun cümleler kurma, samimi ama saygılı ol (Örn: "Merhaba, ben Furkan Bey'in dijital asistanıyım...").
 4. Asla yapay zeka olduğunu gizleme ama robotik de konuşma.
 `;
+
+// Gemini REST API Çağrısı
+async function askGemini(history) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`;
+  
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      systemInstruction: {
+        parts: [{ text: SYSTEM_INSTRUCTION }]
+      },
+      contents: history,
+      generationConfig: {
+        temperature: 0.7
+      }
+    })
+  });
+
+  const data = await response.json();
+  if (!response.ok) {
+    throw new Error(JSON.stringify(data));
+  }
+  return data.candidates?.[0]?.content?.parts?.[0]?.text || 'Şu an yanıt oluşturulamadı, notunuzu ileteceğim.';
+}
 
 // QR Kodu Tarayıcıdan Göstermek İçin Web Arayüzü
 app.get('/', async (req, res) => {
@@ -83,28 +105,18 @@ async function startBot() {
     if (!msg.message || msg.key.fromMe) return;
 
     const sender = msg.key.remoteJid;
-    // Grup mesajlarını ve durum güncellemelerini yoksay
     if (sender.endsWith('@g.us') || sender === 'status@broadcast') return;
 
     const text = msg.message.conversation || msg.message.extendedTextMessage?.text;
     if (!text) return;
 
     try {
-      // Kişinin geçmiş mesajlarını al
       const history = chatHistory.get(sender) || [];
       history.push({ role: 'user', parts: [{ text }] });
       if (history.length > 10) history.shift();
 
-      const response = await ai.models.generateContent({
-        model: 'gemini-2.5-flash',
-        contents: history,
-        config: {
-          systemInstruction: SYSTEM_INSTRUCTION,
-          temperature: 0.7
-        }
-      });
+      const replyText = await askGemini(history);
 
-      const replyText = response.text;
       history.push({ role: 'model', parts: [{ text: replyText }] });
       chatHistory.set(sender, history);
 
