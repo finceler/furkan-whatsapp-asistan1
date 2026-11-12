@@ -27,8 +27,15 @@ Görevlerin:
 4. Asla yapay zeka olduğunu gizleme ama robotik de konuşma.
 `;
 
-// Groq Ücretsiz API Çağrısı (Llama 3.3 70B)
+// Groq Aktif Modeli Otomatik Seçer ve Yanıt Üretir
 async function askGemini(history) {
+  const modelsRes = await fetch('https://api.groq.com/openai/v1/models', {
+    headers: { 'Authorization': `Bearer ${GEMINI_API_KEY}` }
+  });
+  const modelsData = await modelsRes.json();
+  const availableModels = (modelsData.data || []).map(m => m.id).filter(id => !id.includes('whisper') && !id.includes('guard'));
+  const selectedModel = availableModels.find(id => id.includes('llama') || id.includes('gpt') || id.includes('qwen')) || availableModels[0] || 'llama-3.1-8b-instant';
+
   const messages = [
     { role: 'system', content: SYSTEM_INSTRUCTION },
     ...history.map(m => ({
@@ -44,7 +51,7 @@ async function askGemini(history) {
       'Authorization': `Bearer ${GEMINI_API_KEY}`
     },
     body: JSON.stringify({
-      model: 'llama-3.3-70b-versatile',
+      model: selectedModel,
       messages: messages,
       temperature: 0.7
     })
