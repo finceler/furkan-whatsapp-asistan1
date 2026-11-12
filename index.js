@@ -27,21 +27,26 @@ Görevlerin:
 4. Asla yapay zeka olduğunu gizleme ama robotik de konuşma.
 `;
 
-// Gemini REST API Çağrısı
+// Groq Ücretsiz API Çağrısı (Llama 3.3 70B)
 async function askGemini(history) {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`;
-  
-  const response = await fetch(url, {
+  const messages = [
+    { role: 'system', content: SYSTEM_INSTRUCTION },
+    ...history.map(m => ({
+      role: m.role === 'model' ? 'assistant' : 'user',
+      content: m.parts[0].text
+    }))
+  ];
+
+  const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${GEMINI_API_KEY}`
+    },
     body: JSON.stringify({
-      systemInstruction: {
-        parts: [{ text: SYSTEM_INSTRUCTION }]
-      },
-      contents: history,
-      generationConfig: {
-        temperature: 0.7
-      }
+      model: 'llama-3.3-70b-versatile',
+      messages: messages,
+      temperature: 0.7
     })
   });
 
@@ -49,7 +54,7 @@ async function askGemini(history) {
   if (!response.ok) {
     throw new Error(JSON.stringify(data));
   }
-  return data.candidates?.[0]?.content?.parts?.[0]?.text || 'Şu an yanıt oluşturulamadı, notunuzu ileteceğim.';
+  return data.choices?.[0]?.message?.content || 'Şu an yanıt oluşturulamadı, notunuzu ileteceğim.';
 }
 
 // QR Kodu Tarayıcıdan Göstermek İçin Web Arayüzü
