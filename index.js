@@ -6,6 +6,8 @@ const pino = require('pino');
 const app = express();
 const PORT = process.env.PORT || 3000;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+// Furkan Bey'in ana WhatsApp numarası (Örn: 905XXXXXXXXX)
+const FURKAN_PHONE = (process.env.FURKAN_PHONE || '').replace(/\D/g, '');
 
 let latestQR = '';
 let isConnected = false;
@@ -25,6 +27,12 @@ Görevlerin:
    - Furkan Bey'in hafta içi 18:00 sonrası ve hafta sonları daha esnek olduğunu, gündüz saatlerinde ise uygunluk durumuna göre dönüş yapılacağını nazikçe ilet.
 3. Gereksiz uzun cümleler kurma, samimi ama saygılı ol (Örn: "Merhaba, ben Furkan Bey'in dijital asistanıyım...").
 4. Asla yapay zeka olduğunu gizleme ama robotik de konuşma.
+
+ÖNEMLİ BİLDİRİM KURALI:
+Eğer kullanıcı iletmek istediği somut bir not paylaştıysa VEYA görüşme için bir konu/gün/saat bilgisi verdiyse, cevabının EN SONUNA (kullanıcıya görünmeyecek gizli etiket olarak) şu formatı ekle:
+[[BILDIRIM: Kişinin adı (biliniyorsa) | Konu / Randevu Talebi | İletilecek Kısa Özet]]
+
+Eğer kullanıcı sadece "merhaba", "nasılsın", "müsait mi" gibi genel sorular sorduysa ve henüz somut bir not veya saat bilgisi vermediyse bu etiketi KESİNLİKLE EKLEME.
 `;
 
 // Groq Aktif Modeli Otomatik Seçer ve Yanıt Üretir
@@ -119,6 +127,9 @@ async function startBot() {
     const sender = msg.key.remoteJid;
     if (sender.endsWith('@g.us') || sender === 'status@broadcast') return;
 
+    const senderNumber = sender.split('@')[0];
+    const senderName = msg.pushName || 'Bilinmeyen Kişi';
+
     const text = msg.message.conversation || msg.message.extendedTextMessage?.text;
     if (!text) return;
 
@@ -127,12 +138,34 @@ async function startBot() {
       history.push({ role: 'user', parts: [{ text }] });
       if (history.length > 10) history.shift();
 
-      const replyText = await askGemini(history);
+      let rawReply = await askGemini(history);
 
-      history.push({ role: 'model', parts: [{ text: replyText }] });
+      // Gizli [[BILDIRIM: ...]] etiketini yakala ve temizle
+      let notificationSummary = null;
+      const notifyMatch = rawReply.match(/\[\[BILDIRIM:\s*(.*?)\]\]/s);
+      if (notifyMatch) {
+        notificationSummary = notifyMatch[1].trim();
+        rawReply = rawReply.replace(/\[\[BILDIRIM:\s*.*?\]\]/s, '').trim();
+      }
+
+      history.push({ role: 'model', parts: [{ text: rawReply }] });
       chatHistory.set(sender, history);
 
-      await sock.sendMessage(sender, { text: replyText });
+      // 1. Karşı tarafa temiz cevabı gönder
+      await sock.sendMessage(sender, { text: rawReply });
+
+      // 2. Eğer not veya randevu bilgisi alındıysa Furkan Bey'in ana numarasına bildir
+      if (notificationSummary && FURKAN_PHONE && senderNumber !== FURKAN_PHONE) {
+        const furkanJid = `${FURKAN_PHONE}@s.whatsapp.net`;
+        const alertText =
+          `🔔 *Yeni Asistan Bildirimi*\n\n` +
+          `👤 *Gönderen:* ${senderName} (+${senderNumber})\n` +
+          `📋 *Detay:* ${notificationSummary}\n` +
+          `💬 *Son Mesaj:* "${text}"`;
+
+        await sock.sendMessage(furkanJid, { text: alertText });
+        console.log('Furkan Bey ana numarasına özet iletildi.');
+      }
     } catch (err) {
       console.error('Mesaj yanıtlanırken hata:', err);
     }
