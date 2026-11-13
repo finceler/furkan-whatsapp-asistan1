@@ -70,6 +70,7 @@ function getKevskBilgiMesaji() {
     `• *Tarsus (Uzak İlçeler) Alt Kurul Tarihi:* ${formatTRDate(siradaki.uzakAlt)} (Saat 13:00)\n` +
     `• *İlan Reklam Tabela Alt Kurul Tarihi:* ${formatTRDate(siradaki.ilanReklam)} (Saat 15:00)\n` +
     `• *KEVSK Ana Kurul Tarihi:* ${formatTRDate(siradaki.kevsk)} (Saat 15:30)\n\n` +
+     `⚠️ *Önemli Teslim Uyarısı:* Dosya Boyutu 25 MB'den büyük olamaz.\n\n` +
     `⚠️ *Önemli Teslim Uyarısı:* Belirtilen son teslim tarihi, evrakların Tarsus Belediyesi İmar ve Şehircilik Müdürlüğü'ne teslim edilmesi gereken en son tarihtir. Projelerin oluşabilecek yoğunluğu göz önünde bulundurularak evrakların *son teslim tarihinden birkaç gün önce* getirilmesi gerekmektedir.\n\n` +
     `📂 *DOSYALAMA SİSTEMİ (Sırasıyla):*\n` +
     `1 : Başvuru Dilekçesi\n` +
@@ -107,7 +108,6 @@ function getWeatherIconAndText(code) {
 }
 
 async function resolveLocationFromText(rawText) {
-  // 1. Önce mesajda enlem, boylam koordinatı var mı kontrol et (Örn: 36.9218, 34.8709)
   const coordMatch = rawText.match(/(-?\d{1,2}\.\d+)\s*[,;\s]\s*(-?\d{1,3}\.\d+)/);
   if (coordMatch) {
     const lat = parseFloat(coordMatch[1]);
@@ -115,7 +115,6 @@ async function resolveLocationFromText(rawText) {
     return { name: `Koordinat (${lat.toFixed(4)}, ${lon.toFixed(4)})`, lat, lon };
   }
 
-  // 2. Anahtar kelimeleri ve ekleri temizleyerek yer adını çıkar
   let cleaned = rawText
     .replace(/24\s*saatlik/gi, '')
     .replace(/detaylı|detayli|detay/gi, '')
@@ -123,14 +122,12 @@ async function resolveLocationFromText(rawText) {
     .replace(/için|icin|bölgesi|bolgesi|yerin/gi, '')
     .trim();
 
-  // Türkçe iyelik/bulunma eklerini sadeleştir (Örn: "Tarsus'un" -> "Tarsus", "Çamlıyayla'da" -> "Çamlıyayla")
   cleaned = cleaned.replace(/['’](un|ün|ın|in|nun|nün|nın|nin|da|de|ta|te|ya|ye|a|e)\b/gi, '').trim();
 
   if (!cleaned || cleaned.length < 2) {
     return DEFAULT_LOCATION;
   }
 
-  // Open-Meteo Geocoding API (Türkiye öncelikli arama)
   const geoUrl = `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(cleaned)}&count=5&language=tr&format=json`;
   const geoRes = await fetch(geoUrl);
   const geoData = await geoRes.json();
@@ -152,7 +149,6 @@ async function getWeatherReport(rawText) {
     return `⚠️ Belirttiğiniz konum haritada bulunamadı. Lütfen ilçe/mahalle adını (Örn: *Çamlıyayla hava durumu*) veya koordinatı (Örn: *36.9218, 34.8709 hava durumu*) yazarak tekrar deneyin.`;
   }
 
-  // Open-Meteo Yüksek Doğruluklu API (cell_selection=nearest ile tam nokta hücresi)
   const weatherUrl =
     `https://api.open-meteo.com/v1/forecast?latitude=${loc.lat}&longitude=${loc.lon}` +
     `&hourly=temperature_2m,apparent_temperature,relative_humidity_2m,precipitation_probability,precipitation,weather_code,cloud_cover,wind_speed_10m,wind_direction_10m,pressure_msl` +
@@ -165,7 +161,6 @@ async function getWeatherReport(rawText) {
     return '⚠️ Hava durumu verisi şu an alınamadı, lütfen biraz sonra tekrar deneyin.';
   }
 
-  // İstanbul saatine göre şu anki saati bul (YYYY-MM-DDTHH:00)
   const nowParts = new Intl.DateTimeFormat('sv-SE', {
     timeZone: 'Europe/Istanbul',
     year: 'numeric',
@@ -179,13 +174,12 @@ async function getWeatherReport(rawText) {
   let startIndex = data.hourly.time.findIndex(t => t >= currentHourPrefix);
   if (startIndex === -1) startIndex = 0;
 
-  // Mesaj atıldığı saatten itibaren sonraki 24 saat
   const endIndex = Math.min(startIndex + 24, data.hourly.time.length);
   const step = isDetailed ? 1 : 3;
 
   let lines = [];
   for (let i = startIndex; i < endIndex; i += step) {
-    const timeStr = data.hourly.time[i].slice(11, 16); // HH:00
+    const timeStr = data.hourly.time[i].slice(11, 16);
     const temp = Math.round(data.hourly.temperature_2m[i]);
     const feels = Math.round(data.hourly.apparent_temperature[i]);
     const pop = data.hourly.precipitation_probability[i] ?? 0;
@@ -259,7 +253,6 @@ Eğer kullanıcı iletmek istediği somut bir not paylaştıysa, ada/parsel bilg
 Genel bilgi sorularında bu etiketi EKLEME.
 `;
 
-// Dizindeki tüm Excel (.xls / .xlsx) ve PDF dosyalarını otomatik bulup WhatsApp'tan gönderir
 async function sendKevskDocuments(sock, jid) {
   try {
     const allFiles = fs.readdirSync(__dirname);
@@ -371,4 +364,73 @@ async function startBot() {
     }
   });
 
-  sock
+  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    if (type !== 'notify') return;
+    const msg = messages[0];
+    if (!msg.message || msg.key.fromMe) return;
+
+    const sender = msg.key.remoteJid;
+    if (sender.endsWith('@g.us') || sender === 'status@broadcast') return;
+
+    const senderNumber = sender.split('@')[0];
+    const senderName = msg.pushName || 'Bilinmeyen Kişi';
+
+    const text = msg.message.conversation || msg.message.extendedTextMessage?.text;
+    if (!text) return;
+
+    try {
+      const lowerText = text.toLocaleLowerCase('tr-TR');
+
+      const isWeatherQuery = HAVA_KELIMELER.some(k => lowerText.includes(k));
+      if (isWeatherQuery) {
+        const weatherReport = await getWeatherReport(text);
+        await sock.sendMessage(sender, { text: weatherReport });
+        return;
+      }
+
+      const isKevskQuery = KEVSK_KELIMELER.some(k => lowerText.includes(k));
+      if (isKevskQuery) {
+        const bilgiMesaji = getKevskBilgiMesaji();
+        await sock.sendMessage(sender, { text: bilgiMesaji });
+        await sendKevskDocuments(sock, sender);
+        return;
+      }
+
+      const history = chatHistory.get(sender) || [];
+      history.push({ role: 'user', parts: [{ text }] });
+      if (history.length > 10) history.shift();
+
+      let rawReply = await askGemini(history);
+
+      let notificationSummary = null;
+      const notifyMatch = rawReply.match(/\[\[BILDIRIM:\s*(.*?)\]\]/s);
+      if (notifyMatch) {
+        notificationSummary = notifyMatch[1].trim();
+        rawReply = rawReply.replace(/\[\[BILDIRIM:\s*.*?\]\]/s, '').trim();
+      }
+
+      history.push({ role: 'model', parts: [{ text: rawReply }] });
+      chatHistory.set(sender, history);
+
+      await sock.sendMessage(sender, { text: rawReply });
+
+      if (notificationSummary && FURKAN_PHONE && senderNumber !== FURKAN_PHONE) {
+        const furkanJid = `${FURKAN_PHONE}@s.whatsapp.net`;
+        const alertText =
+          `🔔 *Yeni Asistan Bildirimi*\n\n` +
+          `👤 *Gönderen:* ${senderName} (+${senderNumber})\n` +
+          `📋 *Detay:* ${notificationSummary}\n` +
+          `💬 *Son Mesaj:* "${text}"`;
+
+        await sock.sendMessage(furkanJid, { text: alertText });
+      }
+    } catch (err) {
+      console.error('Mesaj yanıtlanırken hata:', err);
+    }
+  });
+}
+
+app.listen(PORT, () => {
+  console.log(`Sunucu ${PORT} portunda çalışıyor.`);
+  startBot();
+});
