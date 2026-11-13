@@ -70,8 +70,7 @@ function getKevskBilgiMesaji() {
     `• *Tarsus (Uzak İlçeler) Alt Kurul Tarihi:* ${formatTRDate(siradaki.uzakAlt)} (Saat 13:00)\n` +
     `• *İlan Reklam Tabela Alt Kurul Tarihi:* ${formatTRDate(siradaki.ilanReklam)} (Saat 15:00)\n` +
     `• *KEVSK Ana Kurul Tarihi:* ${formatTRDate(siradaki.kevsk)} (Saat 15:30)\n\n` +
-     `⚠️ *Önemli Teslim Uyarısı:* Dosya Boyutu 25 MB'den büyük olamaz.\n\n` +
-    `⚠️ *Önemli Teslim Uyarısı:* Belirtilen son teslim tarihi, evrakların Tarsus Belediyesi İmar ve Şehircilik Müdürlüğü'ne teslim edilmesi gereken en son tarihtir. Projelerin oluşabilecek yoğunluğu göz önünde bulundurularak evrakların *son teslim tarihinden birkaç gün önce* getirilmesi gerekmektedir.\n\n` +
+    `⚠️ *Önemli Teslim Uyarısı:* Dosya Boyutu 25 MB'den fazla olmamalı. Belirtilen son teslim tarihi, evrakların Tarsus Belediyesi İmar ve Şehircilik Müdürlüğü'ne teslim edilmesi gereken en son tarihtir. Projelerin oluşabilecek yoğunluğu göz önünde bulundurularak evrakların *son teslim tarihinden birkaç gün önce* getirilmesi gerekmektedir.\n\n` +
     `📂 *DOSYALAMA SİSTEMİ (Sırasıyla):*\n` +
     `1 : Başvuru Dilekçesi\n` +
     `2 : Başvuran İletişim Bilgileri (Proje Başvuru Formu)\n` +
