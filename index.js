@@ -15,6 +15,13 @@ let isConnected = false;
 
 const chatHistory = new Map();
 
+// Varsayılan Koordinat: Tarsus, Mersin
+const DEFAULT_LOCATION = {
+  name: 'Tarsus, Mersin',
+  lat: 36.921833,
+  lon: 34.870917
+};
+
 // =========================================================================
 // 2026 MBB KEVSK KURUL TAKVİMİ (Tarsus - Uzak İlçeler Dahil)
 // =========================================================================
@@ -83,9 +90,141 @@ function getKevskBilgiMesaji() {
 }
 
 // =========================================================================
+// HAVA DURUMU MODÜLÜ (Open-Meteo Yüksek Çözünürlüklü Noktasal Tahmin)
+// =========================================================================
+function getWeatherIconAndText(code) {
+  if (code === 0) return '☀️ Açık';
+  if (code === 1 || code === 2) return '🌤️ Az Bulutlu';
+  if (code === 3) return '☁️ Çok Bulutlu';
+  if (code === 45 || code === 48) return '🌫️ Sisli';
+  if (code >= 51 && code <= 57) return '🌦️ Çisenti';
+  if (code >= 61 && code <= 67) return '🌧️ Yağmurlu';
+  if (code >= 71 && code <= 77) return '❄️ Kar Yağışlı';
+  if (code >= 80 && code <= 82) return '⛈️ Sağanak Yağış';
+  if (code >= 85 && code <= 86) return '🌨️ Kar Sağanağı';
+  if (code >= 95) return '⚡ Gök Gürültülü Fırtına';
+  return '🌡️ Parçalı Bulutlu';
+}
+
+async function resolveLocationFromText(rawText) {
+  // 1. Önce mesajda enlem, boylam koordinatı var mı kontrol et (Örn: 36.9218, 34.8709)
+  const coordMatch = rawText.match(/(-?\d{1,2}\.\d+)\s*[,;\s]\s*(-?\d{1,3}\.\d+)/);
+  if (coordMatch) {
+    const lat = parseFloat(coordMatch[1]);
+    const lon = parseFloat(coordMatch[2]);
+    return { name: `Koordinat (${lat.toFixed(4)}, ${lon.toFixed(4)})`, lat, lon };
+  }
+
+  // 2. Anahtar kelimeleri ve ekleri temizleyerek yer adını çıkar
+  let cleaned = rawText
+    .replace(/24\s*saatlik/gi, '')
+    .replace(/detaylı|detayli|detay/gi, '')
+    .replace(/hava\s*durumu|hava\s*nasıl\s*olacak|hava\s*nasil\s*olacak|havarumu/gi, '')
+    .replace(/için|icin|bölgesi|bolgesi|yerin/gi, '')
+    .trim();
+
+  // Türkçe iyelik/bulunma eklerini sadeleştir (Örn: "Tarsus'un" -> "Tarsus", "Çamlıyayla'da" -> "Çamlıyayla")
+  cleaned = cleaned.replace(/['’](un|ün|ın|in|nun|nün|nın|nin|da|de|ta|te|ya|ye|a|e)\b/gi, '').trim();
+
+  if (!cleaned || cleaned.length < 2) {
+    return DEFAULT_LOCATION;
+  }
+
+  // Open-Meteo Geocoding API (Türkiye öncelikli arama)
+  const geoUrl = `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(cleaned)}&count=5&language=tr&format=json`;
+  const geoRes = await fetch(geoUrl);
+  const geoData = await geoRes.json();
+
+  if (geoData.results && geoData.results.length > 0) {
+    const trMatch = geoData.results.find(r => r.country_code === 'TR') || geoData.results[0];
+    const displayName = [trMatch.name, trMatch.admin1].filter(Boolean).join(', ');
+    return { name: displayName, lat: trMatch.latitude, lon: trMatch.longitude };
+  }
+
+  return null;
+}
+
+async function getWeatherReport(rawText) {
+  const isDetailed = /detay/i.test(rawText);
+  const loc = await resolveLocationFromText(rawText);
+
+  if (!loc) {
+    return `⚠️ Belirttiğiniz konum haritada bulunamadı. Lütfen ilçe/mahalle adını (Örn: *Çamlıyayla hava durumu*) veya koordinatı (Örn: *36.9218, 34.8709 hava durumu*) yazarak tekrar deneyin.`;
+  }
+
+  // Open-Meteo Yüksek Doğruluklu API (cell_selection=nearest ile tam nokta hücresi)
+  const weatherUrl =
+    `https://api.open-meteo.com/v1/forecast?latitude=${loc.lat}&longitude=${loc.lon}` +
+    `&hourly=temperature_2m,apparent_temperature,relative_humidity_2m,precipitation_probability,precipitation,weather_code,cloud_cover,wind_speed_10m,wind_direction_10m,pressure_msl` +
+    `&forecast_days=2&timezone=Europe%2FIstanbul&cell_selection=nearest`;
+
+  const res = await fetch(weatherUrl);
+  const data = await res.json();
+
+  if (!data.hourly || !data.hourly.time) {
+    return '⚠️ Hava durumu verisi şu an alınamadı, lütfen biraz sonra tekrar deneyin.';
+  }
+
+  // İstanbul saatine göre şu anki saati bul (YYYY-MM-DDTHH:00)
+  const nowParts = new Intl.DateTimeFormat('sv-SE', {
+    timeZone: 'Europe/Istanbul',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    hour12: false
+  }).format(new Date()).replace(' ', 'T');
+  const currentHourPrefix = nowParts.slice(0, 13) + ':00';
+
+  let startIndex = data.hourly.time.findIndex(t => t >= currentHourPrefix);
+  if (startIndex === -1) startIndex = 0;
+
+  // Mesaj atıldığı saatten itibaren sonraki 24 saat
+  const endIndex = Math.min(startIndex + 24, data.hourly.time.length);
+  const step = isDetailed ? 1 : 3;
+
+  let lines = [];
+  for (let i = startIndex; i < endIndex; i += step) {
+    const timeStr = data.hourly.time[i].slice(11, 16); // HH:00
+    const temp = Math.round(data.hourly.temperature_2m[i]);
+    const feels = Math.round(data.hourly.apparent_temperature[i]);
+    const pop = data.hourly.precipitation_probability[i] ?? 0;
+    const rain = data.hourly.precipitation[i] ?? 0;
+    const wind = Math.round(data.hourly.wind_speed_10m[i]);
+    const cloud = data.hourly.cloud_cover[i] ?? 0;
+    const humidity = data.hourly.relative_humidity_2m[i] ?? 0;
+    const pressure = Math.round(data.hourly.pressure_msl[i] ?? 0);
+    const desc = getWeatherIconAndText(data.hourly.weather_code[i]);
+
+    if (isDetailed) {
+      lines.push(
+        `🕒 *${timeStr}* | ${desc}\n` +
+        `   🌡️ ${temp}°C (His: ${feels}°C) | 🌧️ %${pop} (${rain} mm)\n` +
+        `   💨 ${wind} km/s | ☁️ Bulut: %${cloud} | 💧 Nem: %${humidity} | 🧭 ${pressure} hPa`
+      );
+    } else {
+      lines.push(
+        `🕒 *${timeStr}* → *${temp}°C* | 🌧️ %${pop} (${rain} mm) | ${desc}`
+      );
+    }
+  }
+
+  const header = isDetailed
+    ? `📊 *24 Saatlik DETAYLI Hava Tahmini (Saatlik)*\n📍 *Konum:* ${loc.name} (${loc.lat.toFixed(4)}, ${loc.lon.toFixed(4)})\n\n`
+    : `🌦️ *24 Saatlik Hava Tahmini (3 Saatlik Özet)*\n📍 *Konum:* ${loc.name}\n\n`;
+
+  const footer = isDetailed
+    ? `\n\n_Kaynak: Open-Meteo Yüksek Çözünürlüklü Noktasal Grid_`
+    : `\n\n💡 _Saatlik rüzgar, bulutluluk, nem ve basınç verileri için *"${loc.name.split(',')[0]} detaylı hava durumu"* yazabilirsiniz._`;
+
+  return header + lines.join('\n') + footer;
+}
+
+// =========================================================================
 // TETİKLEYİCİ ANAHTAR KELİMELER
 // =========================================================================
-const TETIKLEYICI_KELIMELER = ['kurul', 'kurul tarihi', 'kent estetiği', 'kent estetigi', 'kevsk', 'kevskk'];
+const KEVSK_KELIMELER = ['kurul', 'kurul tarihi', 'kent estetiği', 'kent estetigi', 'kevsk', 'kevskk'];
+const HAVA_KELIMELER = ['hava durumu', 'hava nasıl olacak', 'hava nasil olacak', 'havarumu', '24 saatlik hava'];
 
 // =========================================================================
 // YAPAY ZEKA BİLGİ BANKASI
@@ -232,69 +371,4 @@ async function startBot() {
     }
   });
 
-  sock.ev.on('messages.upsert', async ({ messages, type }) => {
-    if (type !== 'notify') return;
-    const msg = messages[0];
-    if (!msg.message || msg.key.fromMe) return;
-
-    const sender = msg.key.remoteJid;
-    if (sender.endsWith('@g.us') || sender === 'status@broadcast') return;
-
-    const senderNumber = sender.split('@')[0];
-    const senderName = msg.pushName || 'Bilinmeyen Kişi';
-
-    const text = msg.message.conversation || msg.message.extendedTextMessage?.text;
-    if (!text) return;
-
-    try {
-      const lowerText = text.toLocaleLowerCase('tr-TR');
-
-      // 1. Anahtar Kelime Kontrolü: "Kurul", "Kurul tarihi", "Kent estetiği"
-      const isKevskQuery = TETIKLEYICI_KELIMELER.some(k => lowerText.includes(k));
-
-      if (isKevskQuery) {
-        const bilgiMesaji = getKevskBilgiMesaji();
-        await sock.sendMessage(sender, { text: bilgiMesaji });
-        await sendKevskDocuments(sock, sender);
-        return;
-      }
-
-      // 2. Diğer mesajlar için Yapay Zeka devreye girer
-      const history = chatHistory.get(sender) || [];
-      history.push({ role: 'user', parts: [{ text }] });
-      if (history.length > 10) history.shift();
-
-      let rawReply = await askGemini(history);
-
-      let notificationSummary = null;
-      const notifyMatch = rawReply.match(/\[\[BILDIRIM:\s*(.*?)\]\]/s);
-      if (notifyMatch) {
-        notificationSummary = notifyMatch[1].trim();
-        rawReply = rawReply.replace(/\[\[BILDIRIM:\s*.*?\]\]/s, '').trim();
-      }
-
-      history.push({ role: 'model', parts: [{ text: rawReply }] });
-      chatHistory.set(sender, history);
-
-      await sock.sendMessage(sender, { text: rawReply });
-
-      if (notificationSummary && FURKAN_PHONE && senderNumber !== FURKAN_PHONE) {
-        const furkanJid = `${FURKAN_PHONE}@s.whatsapp.net`;
-        const alertText =
-          `🔔 *Yeni Asistan Bildirimi*\n\n` +
-          `👤 *Gönderen:* ${senderName} (+${senderNumber})\n` +
-          `📋 *Detay:* ${notificationSummary}\n` +
-          `💬 *Son Mesaj:* "${text}"`;
-
-        await sock.sendMessage(furkanJid, { text: alertText });
-      }
-    } catch (err) {
-      console.error('Mesaj yanıtlanırken hata:', err);
-    }
-  });
-}
-
-app.listen(PORT, () => {
-  console.log(`Sunucu ${PORT} portunda çalışıyor.`);
-  startBot();
-});
+  sock
