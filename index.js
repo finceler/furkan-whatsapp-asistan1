@@ -8,26 +8,28 @@ const path = require('path');
 const app = express();
 const PORT = process.env.PORT || 3000;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const FURKAN_PHONE = (process.env.FURKAN_PHONE || '').replace(/\D/g, '');
-// İsteğe bağlı: Google Cloud'dan Places API anahtarı eklersen Google Haritalar'daki tüm esnafı da tarar
+// Furkan Bey'in ana WhatsApp numarası (Sabit olarak 905309455371 tanımlı)
+const FURKAN_PHONE = (process.env.FURKAN_PHONE || '905309455371').replace(/\D/g, '');
 const GOOGLE_PLACES_API_KEY = process.env.GOOGLE_PLACES_API_KEY || '';
 
 let latestQR = '';
 let isConnected = false;
 
 const chatHistory = new Map();
-// Teklif sorulan firmaların numaralarını hafızada tutar (Gelen yanıtları ayırt etmek için)
 const pendingQuotes = new Map();
+// İlk mesaj tanışma kontrolü (Her kullanıcıya ilk mesajında yapay zeka asistanı olduğunu belirtir)
+const greetedUsers = new Set();
 
-// Varsayılan Koordinat: Tarsus, Mersin
 const DEFAULT_LOCATION = {
   name: 'Tarsus, Mersin',
   lat: 36.921833,
   lon: 34.870917
 };
 
+const INTRO_TEXT = "Merhaba, ben Furkan Bey’in yapay zeka asistanıyım.";
+
 // =========================================================================
-// 2026 MBB KEVSK KURUL TAKVİMİ (Tarsus - Uzak İlçeler Dahil)
+// 2026 MBB KEVSK KURUL TAKVİMİ
 // =========================================================================
 const KURUL_TAKVIMI_2026 = [
   { no: 1,  sonTeslim: '2026-01-09', uzakAlt: '2026-01-15', ilanReklam: '2026-01-15', kevsk: '2026-01-15' },
@@ -94,7 +96,7 @@ function getKevskBilgiMesaji() {
 }
 
 // =========================================================================
-// HAVA DURUMU MODÜLÜ (Open-Meteo Yüksek Çözünürlüklü Noktasal Tahmin)
+// HAVA DURUMU MODÜLÜ (Open-Meteo)
 // =========================================================================
 function getWeatherIconAndText(code) {
   if (code === 0) return '☀️ Açık';
@@ -225,7 +227,6 @@ function normalizeTRMobile(rawPhone) {
   let digits = String(rawPhone).replace(/\D/g, '');
   if (digits.startsWith('90') && digits.length === 12) digits = digits.slice(2);
   if (digits.startsWith('0') && digits.length === 11) digits = digits.slice(1);
-  // Türkiye cep telefonu (5XX XXXXXXX - 10 hane)
   if (/^5\d{9}$/.test(digits)) {
     return '90' + digits;
   }
@@ -238,7 +239,6 @@ async function searchBusinessesOnline(searchQuery) {
   const results = [];
   const seenPhones = new Set();
 
-  // 1. Google Places API (Eğer Railway'e GOOGLE_PLACES_API_KEY eklendiyse)
   if (GOOGLE_PLACES_API_KEY) {
     try {
       const textSearchUrl = `https://maps.googleapis.com/maps/api/place/textsearch/json?query=${encodeURIComponent(searchQuery)}&language=tr&key=${GOOGLE_PLACES_API_KEY}`;
@@ -261,7 +261,6 @@ async function searchBusinessesOnline(searchQuery) {
     }
   }
 
-  // 2. OpenStreetMap (Overpass API - Ücretsiz Harita Taraması)
   try {
     const words = searchQuery.trim().split(/\s+/);
     const cityCandidate = words[0] || 'Tarsus';
@@ -272,7 +271,7 @@ async function searchBusinessesOnline(searchQuery) {
     const trLoc = (geoData.results || []).find(r => r.country_code === 'TR');
 
     if (trLoc) {
-      const radius = 15000; // 15 km yarıçap
+      const radius = 15000;
       const safeKeyword = keywordCandidate.replace(/["\\]/g, '');
       const overpassQuery = `
         [out:json][timeout:15];
@@ -329,7 +328,6 @@ Kurallar:
 }
 
 async function startQuoteCampaign(sock, adminJid, topicLabel, firms, userRequest) {
-  // WhatsApp'ta kayıtlı olanları filtrele
   const validFirms = [];
   for (const f of firms) {
     try {
@@ -337,15 +335,13 @@ async function startQuoteCampaign(sock, adminJid, topicLabel, firms, userRequest
       if (check?.exists) {
         validFirms.push({ name: f.name, phone: f.phone, jid: check.jid });
       }
-    } catch {
-      // Hata durumunda atla
-    }
+    } catch {}
   }
 
   if (validFirms.length === 0) {
     await sock.sendMessage(adminJid, {
       text: `⚠️ *${topicLabel}* için WhatsApp'ta aktif bir cep numarası bulunamadı.\n\n` +
-            `💡 İpucu: Doğrudan numara listesiyle sormak için şu komutu kullanabilirsin:\n` +
+            `💡 Doğrudan numara listesiyle sormak için şu komutu kullanabilirsin:\n` +
             `*!teklifliste 0532XXXXXXX, 0542XXXXXXX | ${userRequest}*`
     });
     return;
@@ -359,7 +355,6 @@ async function startQuoteCampaign(sock, adminJid, topicLabel, firms, userRequest
           `⏳ Spam koruması için firmalara *45–90 saniye* aralıklarla doğal mesaj gönderilecek ve yanıtlar geldikçe sana iletilecek.`
   });
 
-  // Arka planda sırayla gönder (Sunucuyu kilitlemeden)
   (async () => {
     for (let i = 0; i < validFirms.length; i++) {
       const firm = validFirms[i];
@@ -367,15 +362,12 @@ async function startQuoteCampaign(sock, adminJid, topicLabel, firms, userRequest
         const msgText = await generateNaturalQuoteMessage(firm.name, userRequest);
         await sock.sendMessage(firm.jid, { text: msgText });
 
-        // Bu numarayı teklif beklenen firmalar listesine kaydet
         const cleanNum = firm.jid.split('@')[0];
         pendingQuotes.set(cleanNum, {
           firmName: firm.name,
           topic: topicLabel,
           askedAt: Date.now()
         });
-
-        console.log(`Teklif mesajı gönderildi: ${firm.name} (${cleanNum})`);
       } catch (err) {
         console.error(`Firmaya mesaj gönderilemedi (${firm.name}):`, err);
       }
@@ -393,14 +385,14 @@ async function startQuoteCampaign(sock, adminJid, topicLabel, firms, userRequest
 }
 
 // =========================================================================
-// TETİKLEYİCİ ANAHTAR KELİMELER
+// TETİKLEYİCİ ANAHTAR KELİMELER VE BİLGİ BANKASI
 // =========================================================================
 const KEVSK_KELIMELER = ['kurul', 'kurul tarihi', 'kent estetiği', 'kent estetigi', 'kevsk', 'kevskk'];
 const HAVA_KELIMELER = ['hava durumu', 'hava nasıl olacak', 'hava nasil olacak', 'havarumu', '24 saatlik hava'];
 
-// =========================================================================
-// YAPAY ZEKA BİLGİ BANKASI
-// =========================================================================
+// Doğrudan Furkan Bey ile konuşma / görüşme / mesajlaşma talebi kalıpları
+const GORUSME_TALEBI_KALIP = /(furkan\s*bey\s*(ile|le)|kendisi\s*(ile|le)|kendisiyle|bizzat|direkt|doğrudan)\s*(konuşmak|konusmak|görüşmek|gorusmek|mesajlaşmak|mesajlasmak|iletişime\s*geçmek|ulas|ulaş)|^(konuşmak|görüşmek|mesajlaşmak)\s*istiyorum/i;
+
 const BILGI_BANKASI = `
 - Furkan İnceler, Tarsus Belediyesi İmar ve Şehircilik Müdürlüğü bünyesinde CBS ve Kent Estetiği (KEVSKK) süreçleri konusunda görev yapmaktadır.
 - Tarsus, MBB KEVSKK takviminde "Uzak İlçeler" kategorisindedir (Uzak İlçeler Alt Kurul saati: 13:00, İlan Reklam Tabela Alt Kurul saati: 15:00, KEVSK Kurul saati: 15:30).
@@ -414,7 +406,7 @@ const BILGI_BANKASI = `
 `;
 
 const SYSTEM_INSTRUCTION = `
-Sen Furkan İnceler'in kişisel dijital asistanısın. 
+Sen Furkan İnceler'in yapay zeka asistanısın.
 Şu an Furkan Bey müsait değil. Gelen mesajlara kibar, profesyonel, kısa ve net Türkçe ile yanıt ver.
 
 Bilgi Bankan:
@@ -422,13 +414,15 @@ ${BILGI_BANKASI}
 
 Görevlerin:
 1. Karşı taraf Kent Estetiği, kurul tarihi, evrak listesi veya dosyalama hakkında soru sorarsa Bilgi Bankasındaki kesin bilgileri paylaş.
-2. Karşı tarafa şu an Furkan Bey'in müsait olmadığını, en kısa sürede dönüş yapacağını belirt ve varsa ada/parsel numarasını veya iletmek istedikleri notu sor.
-3. Randevu veya görüşme talebi olursa konusunu, tercih ettikleri günü ve saati sor; Furkan Bey'in hafta içi 18:00 sonrası ve hafta sonları daha esnek olduğunu belirt.
+2. Eğer karşı taraf doğrudan Furkan Bey ile konuşmak, görüşmek veya mesajlaşmak istediğini söylerse:
+   - Mutlaka "Talebinizi Furkan Bey'e iletiyorum, kendisi en kısa sürede size dönüş yapacaktır." şeklinde yanıt ver ve varsa konusunu/notunu sor.
+   - Cevabının sonuna [[BILDIRIM: Kişinin adı | Doğrudan Görüşme / Mesajlaşma Talebi | Karşı taraf Furkan Bey ile görüşmek/mesajlaşmak istiyor]] etiketini ekle.
+3. Karşı tarafa şu an Furkan Bey'in müsait olmadığını, en kısa sürede dönüş yapacağını belirt ve varsa ada/parsel numarasını veya iletmek istedikleri notu sor.
 
 ÖNEMLİ BİLDİRİM KURALI:
-Eğer kullanıcı iletmek istediği somut bir not paylaştıysa, ada/parsel bilgisi verdiyse VEYA görüşme için gün/saat bilgisi verdiyse, cevabının EN SONUNA şu gizli etiketi ekle:
-[[BILDIRIM: Kişinin adı (biliniyorsa) | Konu / Randevu Talebi | İletilecek Kısa Özet]]
-Genel bilgi sorularında bu etiketi EKLEME.
+Eğer kullanıcı Furkan Bey ile konuşmak/görüşmek/mesajlaşmak istediyse, iletmek istediği somut bir not paylaştıysa, ada/parsel bilgisi verdiyse VEYA görüşme için gün/saat bilgisi verdiyse, cevabının EN SONUNA şu gizli etiketi ekle:
+[[BILDIRIM: Kişinin adı (biliniyorsa) | Konu / Görüşme Talebi | İletilecek Kısa Özet]]
+Sadece genel hava durumu veya genel evrak bilgisi sorularında bu etiketi EKLEME.
 `;
 
 async function sendKevskDocuments(sock, jid) {
@@ -594,7 +588,7 @@ async function startBot() {
         }
       }
 
-      // 0B. TEKLİF SORULAN BİR FİRMADAN YANIT GELDİYSE (Asistan moduna girme, Furkan Bey'e ilet)
+      // 0B. TEKLİF SORULAN BİR FİRMADAN YANIT GELDİYSE
       if (pendingQuotes.has(senderNumber)) {
         const quoteInfo = pendingQuotes.get(senderNumber);
         if (FURKAN_PHONE) {
@@ -610,24 +604,54 @@ async function startBot() {
         return;
       }
 
-      // 1. Hava Durumu Kontrolü
-      const isWeatherQuery = HAVA_KELIMELER.some(k => lowerText.includes(k));
-      if (isWeatherQuery) {
-        const weatherReport = await getWeatherReport(text);
-        await sock.sendMessage(sender, { text: weatherReport });
+      // İlk mesaj kontrolü: Her yeni kişiyle ilk temasın başına "Merhaba, ben Furkan Bey’in yapay zeka asistanıyım." eklenir
+      const isFirstMessage = !greetedUsers.has(sender);
+      if (isFirstMessage) {
+        greetedUsers.add(sender);
+      }
+      const prefixIntro = (bodyText) => {
+        if (!isFirstMessage) return bodyText;
+        const cleanBody = bodyText.replace(/^merhaba[,!\s]*/i, '');
+        return `${INTRO_TEXT}\n\n${cleanBody}`;
+      };
+
+      // 1. Doğrudan Furkan Bey ile Konuşma / Görüşme / Mesajlaşma Talebi
+      if (GORUSME_TALEBI_KALIP.test(text)) {
+        const replyMsg = prefixIntro(
+          `Talebinizi Furkan Bey'e iletiyorum. Kendisi şu an müsait değil, mesajınızı gördüğünde size en kısa sürede dönüş yapacaktır.\n\nİletmemi istediğiniz özel bir konu veya not varsa buraya yazabilirsiniz.`
+        );
+        await sock.sendMessage(sender, { text: replyMsg });
+
+        if (FURKAN_PHONE && senderNumber !== FURKAN_PHONE) {
+          const furkanJid = `${FURKAN_PHONE}@s.whatsapp.net`;
+          const alertText =
+            `🔔 *Görüşme / Mesajlaşma Talebi*\n\n` +
+            `👤 *Kişi:* ${senderName} (+${senderNumber})\n` +
+            `📌 *Durum:* Karşı taraf doğrudan sizinle konuşmak / görüşmek istediğini belirtti.\n` +
+            `💬 *Mesaj:* "${text}"`;
+          await sock.sendMessage(furkanJid, { text: alertText });
+        }
         return;
       }
 
-      // 2. KEVSKK / Kent Estetiği Kontrolü
+      // 2. Hava Durumu Kontrolü
+      const isWeatherQuery = HAVA_KELIMELER.some(k => lowerText.includes(k));
+      if (isWeatherQuery) {
+        const weatherReport = await getWeatherReport(text);
+        await sock.sendMessage(sender, { text: prefixIntro(weatherReport) });
+        return;
+      }
+
+      // 3. KEVSKK / Kent Estetiği Kontrolü
       const isKevskQuery = KEVSK_KELIMELER.some(k => lowerText.includes(k));
       if (isKevskQuery) {
         const bilgiMesaji = getKevskBilgiMesaji();
-        await sock.sendMessage(sender, { text: bilgiMesaji });
+        await sock.sendMessage(sender, { text: prefixIntro(bilgiMesaji) });
         await sendKevskDocuments(sock, sender);
         return;
       }
 
-      // 3. Diğer mesajlar için Yapay Zeka devreye girer
+      // 4. Diğer tüm mesajlar için Yapay Zeka devreye girer
       const history = chatHistory.get(sender) || [];
       history.push({ role: 'user', parts: [{ text }] });
       if (history.length > 10) history.shift();
@@ -641,10 +665,12 @@ async function startBot() {
         rawReply = rawReply.replace(/\[\[BILDIRIM:\s*.*?\]\]/s, '').trim();
       }
 
-      history.push({ role: 'model', parts: [{ text: rawReply }] });
+      const finalReply = prefixIntro(rawReply);
+
+      history.push({ role: 'model', parts: [{ text: finalReply }] });
       chatHistory.set(sender, history);
 
-      await sock.sendMessage(sender, { text: rawReply });
+      await sock.sendMessage(sender, { text: finalReply });
 
       if (notificationSummary && FURKAN_PHONE && senderNumber !== FURKAN_PHONE) {
         const furkanJid = `${FURKAN_PHONE}@s.whatsapp.net`;
