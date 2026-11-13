@@ -9,11 +9,15 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const FURKAN_PHONE = (process.env.FURKAN_PHONE || '').replace(/\D/g, '');
+// İsteğe bağlı: Google Cloud'dan Places API anahtarı eklersen Google Haritalar'daki tüm esnafı da tarar
+const GOOGLE_PLACES_API_KEY = process.env.GOOGLE_PLACES_API_KEY || '';
 
 let latestQR = '';
 let isConnected = false;
 
 const chatHistory = new Map();
+// Teklif sorulan firmaların numaralarını hafızada tutar (Gelen yanıtları ayırt etmek için)
+const pendingQuotes = new Map();
 
 // Varsayılan Koordinat: Tarsus, Mersin
 const DEFAULT_LOCATION = {
@@ -70,7 +74,7 @@ function getKevskBilgiMesaji() {
     `• *Tarsus (Uzak İlçeler) Alt Kurul Tarihi:* ${formatTRDate(siradaki.uzakAlt)} (Saat 13:00)\n` +
     `• *İlan Reklam Tabela Alt Kurul Tarihi:* ${formatTRDate(siradaki.ilanReklam)} (Saat 15:00)\n` +
     `• *KEVSK Ana Kurul Tarihi:* ${formatTRDate(siradaki.kevsk)} (Saat 15:30)\n\n` +
-    `⚠️ *Önemli Teslim Uyarısı:* Dosya Boyutu 25 MB'den fazla olmamalı. Belirtilen son teslim tarihi, evrakların Tarsus Belediyesi İmar ve Şehircilik Müdürlüğü'ne teslim edilmesi gereken en son tarihtir. Projelerin oluşabilecek yoğunluğu göz önünde bulundurularak evrakların *son teslim tarihinden birkaç gün önce* getirilmesi gerekmektedir.\n\n` +
+    `⚠️ *Önemli Teslim Uyarısı:* Belirtilen son teslim tarihi, evrakların Tarsus Belediyesi İmar ve Şehircilik Müdürlüğü'ne teslim edilmesi gereken en son tarihtir. Projelerin oluşabilecek yoğunluğu göz önünde bulundurularak evrakların *son teslim tarihinden birkaç gün önce* getirilmesi gerekmektedir.\n\n` +
     `📂 *DOSYALAMA SİSTEMİ (Sırasıyla):*\n` +
     `1 : Başvuru Dilekçesi\n` +
     `2 : Başvuran İletişim Bilgileri (Proje Başvuru Formu)\n` +
@@ -214,6 +218,181 @@ async function getWeatherReport(rawText) {
 }
 
 // =========================================================================
+// BÖLGESEL FİRMA BULMA & FİYAT TEKLİFİ TOPLAMA MODÜLÜ
+// =========================================================================
+function normalizeTRMobile(rawPhone) {
+  if (!rawPhone) return null;
+  let digits = String(rawPhone).replace(/\D/g, '');
+  if (digits.startsWith('90') && digits.length === 12) digits = digits.slice(2);
+  if (digits.startsWith('0') && digits.length === 11) digits = digits.slice(1);
+  // Türkiye cep telefonu (5XX XXXXXXX - 10 hane)
+  if (/^5\d{9}$/.test(digits)) {
+    return '90' + digits;
+  }
+  return null;
+}
+
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+async function searchBusinessesOnline(searchQuery) {
+  const results = [];
+  const seenPhones = new Set();
+
+  // 1. Google Places API (Eğer Railway'e GOOGLE_PLACES_API_KEY eklendiyse)
+  if (GOOGLE_PLACES_API_KEY) {
+    try {
+      const textSearchUrl = `https://maps.googleapis.com/maps/api/place/textsearch/json?query=${encodeURIComponent(searchQuery)}&language=tr&key=${GOOGLE_PLACES_API_KEY}`;
+      const tsRes = await fetch(textSearchUrl);
+      const tsData = await tsRes.json();
+
+      for (const place of (tsData.results || []).slice(0, 12)) {
+        const detailUrl = `https://maps.googleapis.com/maps/api/place/details/json?place_id=${place.place_id}&fields=name,formatted_phone_number,international_phone_number&language=tr&key=${GOOGLE_PLACES_API_KEY}`;
+        const dRes = await fetch(detailUrl);
+        const dData = await dRes.json();
+        const rawPhone = dData.result?.international_phone_number || dData.result?.formatted_phone_number;
+        const phone = normalizeTRMobile(rawPhone);
+        if (phone && !seenPhones.has(phone)) {
+          seenPhones.add(phone);
+          results.push({ name: place.name, phone });
+        }
+      }
+    } catch (e) {
+      console.error('Google Places arama hatası:', e);
+    }
+  }
+
+  // 2. OpenStreetMap (Overpass API - Ücretsiz Harita Taraması)
+  try {
+    const words = searchQuery.trim().split(/\s+/);
+    const cityCandidate = words[0] || 'Tarsus';
+    const keywordCandidate = words.slice(1).join(' ') || searchQuery;
+
+    const geoRes = await fetch(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(cityCandidate)}&count=3&language=tr&format=json`);
+    const geoData = await geoRes.json();
+    const trLoc = (geoData.results || []).find(r => r.country_code === 'TR');
+
+    if (trLoc) {
+      const radius = 15000; // 15 km yarıçap
+      const safeKeyword = keywordCandidate.replace(/["\\]/g, '');
+      const overpassQuery = `
+        [out:json][timeout:15];
+        (
+          node["name"~"${safeKeyword}",i](around:${radius},${trLoc.latitude},${trLoc.longitude});
+          way["name"~"${safeKeyword}",i](around:${radius},${trLoc.latitude},${trLoc.longitude});
+        );
+        out center tags 25;
+      `;
+      const ovRes = await fetch('https://overpass-api.de/api/interpreter', {
+        method: 'POST',
+        body: overpassQuery
+      });
+      const ovData = await ovRes.json();
+
+      for (const el of (ovData.elements || [])) {
+        const tags = el.tags || {};
+        const rawPhone = tags.phone || tags['contact:phone'] || tags['contact:whatsapp'] || tags.mobile;
+        const phone = normalizeTRMobile(rawPhone);
+        if (phone && !seenPhones.has(phone)) {
+          seenPhones.add(phone);
+          results.push({ name: tags.name || 'İşletme', phone });
+        }
+      }
+    }
+  } catch (e) {
+    console.error('Overpass arama hatası:', e);
+  }
+
+  return results;
+}
+
+async function generateNaturalQuoteMessage(firmName, userRequest) {
+  try {
+    const prompt = [
+      {
+        role: 'user',
+        parts: [{
+          text: `Sen Furkan İnceler adına bir işletmeye WhatsApp üzerinden fiyat soran gerçek bir müşterisin.
+Firma Adı: ${firmName}
+Fiyat Sorulacak Konu/Detay: ${userRequest}
+
+Kurallar:
+- Kesinlikle yapay zeka, bot veya asistan olduğundan bahsetme.
+- Samimi, kibar ve doğal bir Türkçe ile tek paragraf (en fazla 3 cümle) yaz.
+- Firmaya adıyla selam ver ve doğrudan fiyat teklifi/bilgi iste.`
+        }]
+      }
+    ];
+    return await askGemini(prompt, 'Sen doğal bir müşteri diliyle kısa fiyat teklifi mesajı yazan yardımcısın.');
+  } catch {
+    return `Merhaba ${firmName}, iyi çalışmalar dilerim. ${userRequest} konusunda güncel fiyat teklifinizi paylaşabilir misiniz? Teşekkürler.`;
+  }
+}
+
+async function startQuoteCampaign(sock, adminJid, topicLabel, firms, userRequest) {
+  // WhatsApp'ta kayıtlı olanları filtrele
+  const validFirms = [];
+  for (const f of firms) {
+    try {
+      const [check] = await sock.onWhatsApp(`${f.phone}@s.whatsapp.net`);
+      if (check?.exists) {
+        validFirms.push({ name: f.name, phone: f.phone, jid: check.jid });
+      }
+    } catch {
+      // Hata durumunda atla
+    }
+  }
+
+  if (validFirms.length === 0) {
+    await sock.sendMessage(adminJid, {
+      text: `⚠️ *${topicLabel}* için WhatsApp'ta aktif bir cep numarası bulunamadı.\n\n` +
+            `💡 İpucu: Doğrudan numara listesiyle sormak için şu komutu kullanabilirsin:\n` +
+            `*!teklifliste 0532XXXXXXX, 0542XXXXXXX | ${userRequest}*`
+    });
+    return;
+  }
+
+  const listPreview = validFirms.map((f, idx) => `${idx + 1}. ${f.name} (+${f.phone})`).join('\n');
+  await sock.sendMessage(adminJid, {
+    text: `🚀 *Fiyat Teklifi Taraması Başlatıldı*\n\n` +
+          `📌 *Konu:* ${topicLabel}\n` +
+          `🏢 *WhatsApp Aktif Firma (${validFirms.length} adet):*\n${listPreview}\n\n` +
+          `⏳ Spam koruması için firmalara *45–90 saniye* aralıklarla doğal mesaj gönderilecek ve yanıtlar geldikçe sana iletilecek.`
+  });
+
+  // Arka planda sırayla gönder (Sunucuyu kilitlemeden)
+  (async () => {
+    for (let i = 0; i < validFirms.length; i++) {
+      const firm = validFirms[i];
+      try {
+        const msgText = await generateNaturalQuoteMessage(firm.name, userRequest);
+        await sock.sendMessage(firm.jid, { text: msgText });
+
+        // Bu numarayı teklif beklenen firmalar listesine kaydet
+        const cleanNum = firm.jid.split('@')[0];
+        pendingQuotes.set(cleanNum, {
+          firmName: firm.name,
+          topic: topicLabel,
+          askedAt: Date.now()
+        });
+
+        console.log(`Teklif mesajı gönderildi: ${firm.name} (${cleanNum})`);
+      } catch (err) {
+        console.error(`Firmaya mesaj gönderilemedi (${firm.name}):`, err);
+      }
+
+      if (i < validFirms.length - 1) {
+        const randomDelayMs = (45 + Math.floor(Math.random() * 45)) * 1000;
+        await sleep(randomDelayMs);
+      }
+    }
+
+    await sock.sendMessage(adminJid, {
+      text: `✅ *${topicLabel}* için listedeki tüm firmalara (${validFirms.length} firma) teklif mesajları iletildi. Yanıt geldikçe sana bildireceğim.`
+    });
+  })();
+}
+
+// =========================================================================
 // TETİKLEYİCİ ANAHTAR KELİMELER
 // =========================================================================
 const KEVSK_KELIMELER = ['kurul', 'kurul tarihi', 'kent estetiği', 'kent estetigi', 'kevsk', 'kevskk'];
@@ -281,7 +460,7 @@ async function sendKevskDocuments(sock, jid) {
   }
 }
 
-async function askGemini(history) {
+async function askGemini(history, customSystemPrompt = null) {
   const modelsRes = await fetch('https://api.groq.com/openai/v1/models', {
     headers: { 'Authorization': `Bearer ${GEMINI_API_KEY}` }
   });
@@ -290,7 +469,7 @@ async function askGemini(history) {
   const selectedModel = availableModels.find(id => id.includes('llama') || id.includes('gpt') || id.includes('qwen')) || availableModels[0] || 'llama-3.1-8b-instant';
 
   const messages = [
-    { role: 'system', content: SYSTEM_INSTRUCTION },
+    { role: 'system', content: customSystemPrompt || SYSTEM_INSTRUCTION },
     ...history.map(m => ({
       role: m.role === 'model' ? 'assistant' : 'user',
       content: m.parts[0].text
@@ -335,7 +514,8 @@ app.get('/', async (req, res) => {
 });
 
 async function startBot() {
-  const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
+  const authFolder = path.join(__dirname, 'auth_info_baileys');
+  const { state, saveCreds } = await useMultiFileAuthState(authFolder);
 
   const sock = makeWASocket({
     auth: state,
@@ -380,6 +560,57 @@ async function startBot() {
     try {
       const lowerText = text.toLocaleLowerCase('tr-TR');
 
+      // 0A. SADECE FURKAN BEY'DEN GELEN FİYAT TEKLİFİ KOMUTLARI
+      if (FURKAN_PHONE && senderNumber === FURKAN_PHONE) {
+        if (lowerText.startsWith('!teklifliste ')) {
+          const parts = text.slice(13).split('|');
+          if (parts.length < 2) {
+            await sock.sendMessage(sender, {
+              text: '⚠️ Kullanım: *!teklifliste 0532XXXXXXX, 0542XXXXXXX | Sorulacak teklif mesajı*'
+            });
+            return;
+          }
+          const rawNumbers = parts[0].split(/[,;\s]+/).map(n => normalizeTRMobile(n)).filter(Boolean);
+          const userRequest = parts.slice(1).join('|').trim();
+          const firms = rawNumbers.map((phone, idx) => ({ name: `Firma ${idx + 1}`, phone }));
+          await startQuoteCampaign(sock, sender, 'Özel Numara Listesi', firms, userRequest);
+          return;
+        }
+
+        if (lowerText.startsWith('!teklif ')) {
+          const parts = text.slice(8).split('|');
+          if (parts.length < 2) {
+            await sock.sendMessage(sender, {
+              text: '⚠️ Kullanım: *!teklif Tarsus cam balkon | Balkon ölçüm 250x250 cm, fiyat alabilir miyim?*'
+            });
+            return;
+          }
+          const searchQuery = parts[0].trim();
+          const userRequest = parts.slice(1).join('|').trim();
+          await sock.sendMessage(sender, { text: `🔍 *${searchQuery}* için bölgedeki firmalar taranıyor, lütfen bekleyin...` });
+          const firms = await searchBusinessesOnline(searchQuery);
+          await startQuoteCampaign(sock, sender, searchQuery, firms, userRequest);
+          return;
+        }
+      }
+
+      // 0B. TEKLİF SORULAN BİR FİRMADAN YANIT GELDİYSE (Asistan moduna girme, Furkan Bey'e ilet)
+      if (pendingQuotes.has(senderNumber)) {
+        const quoteInfo = pendingQuotes.get(senderNumber);
+        if (FURKAN_PHONE) {
+          const furkanJid = `${FURKAN_PHONE}@s.whatsapp.net`;
+          const quoteAlert =
+            `💰 *Fiyat Teklifi Yanıtı Geldi*\n\n` +
+            `🏢 *Firma:* ${quoteInfo.firmName} (${senderName})\n` +
+            `📞 *Telefon:* +${senderNumber}\n` +
+            `📌 *Konu:* ${quoteInfo.topic}\n` +
+            `💬 *Gelen Yanıt:* "${text}"`;
+          await sock.sendMessage(furkanJid, { text: quoteAlert });
+        }
+        return;
+      }
+
+      // 1. Hava Durumu Kontrolü
       const isWeatherQuery = HAVA_KELIMELER.some(k => lowerText.includes(k));
       if (isWeatherQuery) {
         const weatherReport = await getWeatherReport(text);
@@ -387,6 +618,7 @@ async function startBot() {
         return;
       }
 
+      // 2. KEVSKK / Kent Estetiği Kontrolü
       const isKevskQuery = KEVSK_KELIMELER.some(k => lowerText.includes(k));
       if (isKevskQuery) {
         const bilgiMesaji = getKevskBilgiMesaji();
@@ -395,6 +627,7 @@ async function startBot() {
         return;
       }
 
+      // 3. Diğer mesajlar için Yapay Zeka devreye girer
       const history = chatHistory.get(sender) || [];
       history.push({ role: 'user', parts: [{ text }] });
       if (history.length > 10) history.shift();
