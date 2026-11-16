@@ -13,49 +13,87 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // Çevre Değişkenleri (Railway Variables)
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const OWNER_NUMBER = '905309455371@s.whatsapp.net'; // KENDİ NUMARANI BURAYA YAZ (Başında + olmadan, sonu @s.whatsapp.net)
+const GEMINI_API_KEY = (process.env.GEMINI_API_KEY || '').trim();
+const OWNER_NUMBER = '905XXXXXXXXX@s.whatsapp.net'; // KENDİ NUMARANI BURAYA YAZ (Başında + olmadan)
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'furkan123';
 
 let qrCodeData = null;
 let connectionStatus = 'Bağlantı bekleniyor...';
 
-// Kullanıcı bazlı kısa süreli sohbet hafızası (Doğal AI sohbeti için)
 const chatHistories = new Map();
 
-// Gerçek telefon numarasını ayıklama fonksiyonu (LID sorununu çözer)
-function extractRealPhoneNumber(msg) {
+// LID veya JID'den gerçek telefon numarasını çözen fonksiyon
+async function resolveRealPhoneNumber(sock, msg) {
     const key = msg.key;
-    // Baileys yeni sürümlerde gerçek numarayı senderPn veya remoteJidAlt içinde tutar
-    const rawJid = key.senderPn || key.remoteJidAlt || key.participant || key.remoteJid || '';
-    const digits = rawJid.split('@')[0].split(':')[0].replace(/\D/g, '');
-    
+    let candidateJid = key.senderPn || key.remoteJidAlt || key.participant || key.remoteJid || '';
+
+    // Eğer hala @lid formatındaysa Baileys LID eşleştiricisinden gerçek numarayı sorgula
+    if (candidateJid.endsWith('@lid') && sock?.signalRepository?.lidMapping?.getPNForLID) {
+        try {
+            const mappedPn = await sock.signalRepository.lidMapping.getPNForLID(candidateJid);
+            if (mappedPn) {
+                candidateJid = mappedPn;
+            }
+        } catch (err) {
+            console.log('LID çözümleme atlandı:', err.message);
+        }
+    }
+
+    const digits = candidateJid.split('@')[0].split(':')[0].replace(/\D/g, '');
+
     if (digits.startsWith('90') && digits.length === 12) {
         return `+${digits}`;
-    } else if (digits.length >= 10) {
-        return `+${digits}`;
     }
-    return rawJid.split('@')[0];
+    if (candidateJid.endsWith('@lid')) {
+        return `Gizli Numara (LID: ${digits})`;
+    }
+    return digits ? `+${digits}` : 'Bilinmeyen Numara';
 }
 
 // Mesai saati kontrolü (Türkiye saati UTC+3, Hafta içi 08:30 - 17:30)
 function isOutOfOffice() {
     const now = new Date();
     const trTime = new Date(now.toLocaleString('en-US', { timeZone: 'Europe/Istanbul' }));
-    const day = trTime.getDay(); // 0: Pazar, 6: Cumartesi
-    const hour = trTime.getHours();
-    const minute = trTime.getMinutes();
-    const totalMinutes = hour * 60 + minute;
+    const day = trTime.getDay();
+    const totalMinutes = trTime.getHours() * 60 + trTime.getMinutes();
 
     if (day === 0 || day === 6) return true;
     if (totalMinutes < 8 * 60 + 30 || totalMinutes > 17 * 60 + 30) return true;
     return false;
 }
 
+// Gemini API İstek Yardımcı Fonksiyonu
+async function callGeminiModel(modelName, systemInstruction, history) {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${GEMINI_API_KEY}`;
+    const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            system_instruction: { parts: [{ text: systemInstruction }] },
+            contents: history,
+            generationConfig: {
+                temperature: 0.7,
+                maxOutputTokens: 800
+            }
+        })
+    });
+
+    const data = await response.json();
+    if (!response.ok || data.error) {
+        throw new Error(data.error?.message || `HTTP ${response.status}`);
+    }
+
+    const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!text) {
+        throw new Error('Boş yanıt döndü');
+    }
+    return text;
+}
+
 // Gemini AI Yanıt Üretici
 async function askGemini(userId, senderName, realPhone, userMessage) {
     if (!GEMINI_API_KEY) {
-        return 'Sistem yapılandırması devam ediyor (API anahtarı eksik). Lütfen daha sonra tekrar deneyin.';
+        return 'Sistem yapılandırması eksik: Railway Variables içinde GEMINI_API_KEY tanımlı değil.';
     }
 
     if (!chatHistories.has(userId)) {
@@ -83,7 +121,7 @@ Ayrıca Furkan Bey'in iş süreçleri hakkında şu bilgilere hakimsin:
      10) 3D Renderlar (Görselleştirmeler)
      11) Açıklama Raporu
      12) Proje Kontrol Formu
-   Kullanıcı evrakları sorarsa bu listeyi düzenli şekilde paylaş veya sorduğu evrakla ilgili açıklama yap.
+   Kullanıcı evrakları veya kurulu sorarsa bu süreci ve listeyi düzenli şekilde paylaş.
 
 2. TARSUS MAHALLE HAVA DURUMU:
    - Kullanıcı Tarsus veya mahalleleri (Bahşiş, Beydeğirmeni, Ünlüköy, Boztepe, Gülek, Çamlıyayla vb.) hakkında hava durumu sorarsa kendi genel meteorolojik bilgin ve güncel mevsim koşullarına göre yardımcı ol.
@@ -97,10 +135,10 @@ Ayrıca Furkan Bey'in iş süreçleri hakkında şu bilgilere hakimsin:
      a) Kullanıcı randevu için Ad-Soyad ve konu bilgisini tamamladıysa,
      b) Mesajda "ACİL" veya çok acil bir durum varsa,
      c) Önemli bir belediye/proje evrak teslimi talebi iletildiyse,
-   Yanıtının EN SONUNA şu gizli etiketi ekle (kullanıcı bunu görmeyecek, sistem yakalayacak):
+   Yanıtının EN SONUNA şu gizli etiketi ekle:
    [BILDIRIM: Kategori | Kısa Özet]
    Örnek: [BILDIRIM: Randevu Talebi | Ahmet Yılmaz - İmar durumu ve mimari proje görüşmesi]
-   Eğer sadece normal sohbet ediliyorsa veya kullanıcı henüz randevu detaylarını (ad/konu) vermediyse bu etiketi EKLEME.
+   Sadece normal sohbet ediliyorsa veya kullanıcı henüz randevu detaylarını vermediyse bu etiketi EKLEME.
 `;
 
     history.push({
@@ -108,33 +146,18 @@ Ayrıca Furkan Bey'in iş süreçleri hakkında şu bilgilere hakimsin:
         parts: [{ text: `Gönderen Adı: ${senderName} (${realPhone})\nMesaj: ${userMessage}` }]
     });
 
-    // Hafızayı son 10 mesajla sınırla
     if (history.length > 10) {
         history.splice(0, history.length - 10);
     }
 
     try {
-        const response = await fetch(
-            `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
-            {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    system_instruction: { parts: [{ text: systemInstruction }] },
-                    contents: history,
-                    generationConfig: {
-                        temperature: 0.7,
-                        maxOutputTokens: 800
-                    }
-                })
-            }
-        );
-
-        const data = await response.json();
-        let replyText = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-
-        if (!replyText) {
-            return 'Şu an mesajınızı işlerken kısa bir gecikme yaşadım, tekrar yazar mısınız?';
+        // Önce gemini-2.5-flash dene, hata verirse gemini-2.0-flash'a geç
+        let replyText;
+        try {
+            replyText = await callGeminiModel('gemini-2.5-flash', systemInstruction, history);
+        } catch (primaryErr) {
+            console.log('gemini-2.5-flash hatası, gemini-2.0-flash deneniyor:', primaryErr.message);
+            replyText = await callGeminiModel('gemini-2.0-flash', systemInstruction, history);
         }
 
         history.push({
@@ -144,8 +167,10 @@ Ayrıca Furkan Bey'in iş süreçleri hakkında şu bilgilere hakimsin:
 
         return replyText;
     } catch (error) {
-        console.error('Gemini API Hatası:', error);
-        return 'Şu an yapay zeka servisine bağlanırken geçici bir sorun oluştu, biraz sonra tekrar deneyebilirsiniz.';
+        console.error('Gemini API Kesin Hata:', error.message);
+        // Hatalı kullanıcı mesajını geçmişten çıkar ki sonraki mesajları bozmasın
+        history.pop();
+        return `Şu an yapay zeka servisinde geçici bir sorun var (${error.message}). Lütfen biraz sonra tekrar deneyin.`;
     }
 }
 
@@ -194,7 +219,6 @@ async function connectToWhatsApp() {
         if (!msg.message || msg.key.fromMe) return;
 
         const remoteJid = msg.key.remoteJid;
-        // Grup mesajlarını ve durum güncellemelerini yoksay
         if (remoteJid.endsWith('@g.us') || remoteJid === 'status@broadcast') return;
 
         const text =
@@ -206,36 +230,30 @@ async function connectToWhatsApp() {
         if (!text.trim()) return;
 
         const senderName = msg.pushName || 'İsimsiz Kullanıcı';
-        const realPhone = extractRealPhoneNumber(msg);
+        const realPhone = await resolveRealPhoneNumber(sock, msg);
 
         console.log(`Yeni mesaj [${senderName} - ${realPhone}]: ${text}`);
 
-        // Yazıyor... efekti göster
         await sock.sendPresenceUpdate('composing', remoteJid);
 
         let aiResponse = await askGemini(remoteJid, senderName, realPhone, text);
 
-        // Gizli bildirim etiketini kontrol et
         const notificationMatch = aiResponse.match(/\[BILDIRIM:\s*(.*?)\]/i);
         let notificationDetail = null;
 
         if (notificationMatch) {
             notificationDetail = notificationMatch[1].trim();
-            // Kullanıcının göreceği mesajdan etiketi temizle
             aiResponse = aiResponse.replace(/\[BILDIRIM:\s*.*?\]/gi, '').trim();
         }
 
-        // Mesai dışı bilgisi ekle (Sadece sohbetin ilk mesajında veya randevu/acil durumunda)
         const isFirstMessage = (chatHistories.get(remoteJid)?.length || 0) <= 2;
         if (isOutOfOffice() && (isFirstMessage || notificationDetail)) {
             aiResponse += `\n\n_Not: Şu an mesai saatleri dışındayız. Acil bir durum varsa mesajınızda *ACİL* belirtmeniz yeterlidir._`;
         }
 
-        // Kullanıcıya yanıtı gönder
         await sock.sendMessage(remoteJid, { text: aiResponse });
         await sock.sendPresenceUpdate('paused', remoteJid);
 
-        // Eğer randevu tamamlandıysa veya mesajda ACİL geçiyorsa sana bildirim at
         const isUrgent = text.toLocaleLowerCase('tr-TR').includes('acil');
         if ((notificationDetail || isUrgent) && OWNER_NUMBER.includes('905')) {
             const detailText = notificationDetail || 'Acil Mesaj Bildirimi';
@@ -250,7 +268,6 @@ async function connectToWhatsApp() {
     });
 }
 
-// Web Arayüzü (QR Kod ve Durum Kontrolü)
 app.get('/', (req, res) => {
     const pass = req.query.pass;
     if (pass !== ADMIN_PASSWORD) {
