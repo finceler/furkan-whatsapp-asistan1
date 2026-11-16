@@ -15,10 +15,11 @@ const PizZip = require('pizzip');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Çevre Değişkenleri (Railway Variables)
+// Çevre Değişkenleri ve Numara Ayarları
 const GEMINI_API_KEY = (process.env.GEMINI_API_KEY || '').trim();
 const SHEET_WEBHOOK_URL = (process.env.SHEET_WEBHOOK_URL || '').trim();
-const OWNER_NUMBER = '905XXXXXXXXX@s.whatsapp.net'; // KENDİ NUMARANI BURAYA YAZ (Başında + olmadan)
+const OWNER_NUMBER = '905XXXXXXXXX@s.whatsapp.net'; // KENDİ KİŞİSEL NUMARAN (Bildirimlerin gideceği numara)
+const ASSISTANT_NUMBER = '905XXXXXXXXX'; // ASİSTAN BOTUNUN NUMARASI (Tıklanabilir link için, başında + olmadan)
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'furkan123';
 
 // Word Şablon Dosya Adları
@@ -40,7 +41,44 @@ function escapeXml(str) {
         .replace(/'/g, '&apos;');
 }
 
-// Word (.docx) içindeki bölünmüş XML <w:t> etiketlerini dahi yakalayıp 1, 2, 3, 456 alanlarını dolduran kesin çözüm
+// Kullanıcının gönderdiği 7 maddelik formu doğrudan kod ile ayrıştıran fonksiyon (AI'ya bağlı kalmaz)
+function parseKurulFormText(text) {
+    const lines = text.split(/\r?\n/);
+    const result = {
+        mahallesi: '',
+        adaNo: '',
+        parselNo: '',
+        muellifi: '',
+        maliki: '',
+        parselM2: '',
+        insaatM2: ''
+    };
+
+    for (const line of lines) {
+        const clean = line.trim();
+        if (!clean) continue;
+
+        const sepMatch = clean.match(/[:;]\s*(.+)$/);
+        const val = sepMatch ? sepMatch[1].trim() : '';
+        const lower = clean.toLocaleLowerCase('tr-TR');
+
+        if (lower.includes('mahalle')) result.mahallesi = val;
+        else if (lower.includes('ada')) result.adaNo = val;
+        else if (lower.includes('parsel no') || (lower.includes('parsel') && !lower.includes('m²') && !lower.includes('m2'))) result.parselNo = val;
+        else if (lower.includes('müellif')) result.muellifi = val;
+        else if (lower.includes('malik')) result.maliki = val;
+        else if (lower.includes('parsel') && (lower.includes('m²') || lower.includes('m2'))) result.parselM2 = val;
+        else if (lower.includes('inşaat') || lower.includes('insaat')) result.insaatM2 = val;
+    }
+
+    // En az Mahalle, Ada ve Parsel doldurulmuşsa geçerli bir form girişidir
+    if (result.mahallesi && result.adaNo && result.parselNo) {
+        return result;
+    }
+    return null;
+}
+
+// Word (.docx) içindeki 1, 2, 3, 456 alanlarını dolduran fonksiyon
 function fillDocxTemplate(templateFilename, data) {
     const filePath = path.join(__dirname, templateFilename);
     if (!fs.existsSync(filePath)) {
@@ -57,7 +95,6 @@ function fillDocxTemplate(templateFilename, data) {
     const parsel = escapeXml(String(data.parselNo || '').trim());
     const malik = escapeXml((data.maliki || '').toLocaleUpperCase('tr-TR').trim());
 
-    // Tüm <w:t ...>...</w:t> düğümlerini çıkar ve karakter bazlı harita oluştur
     const textNodes = [];
     const regex = /<w:t(?:\s[^>]*)?>([\s\S]*?)<\/w:t>/g;
     let match;
@@ -70,9 +107,8 @@ function fillDocxTemplate(templateFilename, data) {
         });
     }
 
-    // Birleştirilmiş düz metin üzerinde konumları bul
     let combinedText = '';
-    const charMap = []; // Her karakterin hangi textNode ve kaçıncı indexte olduğunu tutar
+    const charMap = [];
     textNodes.forEach((node, nodeIdx) => {
         for (let i = 0; i < node.text.length; i++) {
             charMap.push({ nodeIdx, charIdx: i });
@@ -80,7 +116,6 @@ function fillDocxTemplate(templateFilename, data) {
         }
     });
 
-    // Değiştirilecek kalıplar (Sondan başa uygulanacak ki indeksler kaymasın)
     const patterns = [
         { regex: /(ilçesi,\s*)1(\s*Mahallesi)/gi, replacement: mahalle },
         { regex: /(tapunun\s*)2(\s*ada)/gi, replacement: ada },
@@ -102,15 +137,12 @@ function fillDocxTemplate(templateFilename, data) {
         }
     }
 
-    // İndeks kaymasını önlemek için büyük indeksten küçüğe sırala
     replacements.sort((a, b) => b.start - a.start);
 
-    // Karakter dizilerini güncelle
     const nodeChars = textNodes.map((n) => n.text.split(''));
     for (const rep of replacements) {
         if (rep.start >= charMap.length) continue;
         const firstPos = charMap[rep.start];
-        // İlk karaktere yeni değerin tamamını yaz, diğer eski karakterleri boşalt
         nodeChars[firstPos.nodeIdx][firstPos.charIdx] = rep.value;
         for (let pos = rep.start + 1; pos < rep.end && pos < charMap.length; pos++) {
             const p = charMap[pos];
@@ -118,7 +150,6 @@ function fillDocxTemplate(templateFilename, data) {
         }
     }
 
-    // Güncellenmiş metinleri XML'e geri yerleştir
     let rebuiltXml = '';
     let lastPos = 0;
     textNodes.forEach((node, idx) => {
@@ -133,7 +164,6 @@ function fillDocxTemplate(templateFilename, data) {
     return zip.generate({ type: 'nodebuffer', compression: 'DEFLATE' });
 }
 
-// Klasördeki kurul takvimi ve başvuru Excel/PDF dosyalarını gönderen fonksiyon
 async function sendKurulAttachments(sock, remoteJid) {
     try {
         const files = fs.readdirSync(__dirname);
@@ -231,7 +261,7 @@ async function appendToKevksSheet(recordData) {
         try {
             return JSON.parse(rawText);
         } catch {
-            return { status: 'yanit_ayristirilamadi', raw: rawText.slice(0, 100) };
+            return { status: 'yanit_ayristirilamadi', raw: rawText.slice(0, 120) };
         }
     } catch (error) {
         console.error('E-Tablo kayıt hatası:', error.message);
@@ -291,20 +321,12 @@ async function askGemini(userId, senderName, realPhone, userMessage) {
 Sen Furkan İnceler'in (Furkan Bey) profesyonel, kibar, zeki ve doğal konuşan yapay zeka WhatsApp asistanısın.
 Kullanıcılarla tıpkı gerçek bir yapay zeka (Gemini) gibi akıcı, samimi ama saygılı bir dille sohbet et. Genel kültür, teknik konular, günlük sohbet veya merak ettikleri her konuda yardımcı ol.
 
-Ayrıca Furkan Bey'in iş süreçleri hakkında şu kurallara KESİN olarak uy:
-1. KURUL PROJE KAYIT ETİKETİ (ÇOK ÖNEMLİ):
-   - Kullanıcı kurul kayıt tablosu ve başvuru dilekçeleri için gereken 7 proje bilgisini (MAHALLESİ, ADA NO, PARSEL NO, MÜELLİFİ, MALİKİ, PARSEL m², İNŞAAT m²) verdiğinde:
-     a) Bilgileri aldığını, KEVKS kurul kayıt tablosuna işlendiğini ve hazırlanan Tarsus Belediyesi ile Mersin Büyükşehir Belediyesi başvuru dilekçelerinin ekte gönderildiğini nazikçe belirt.
-     b) Yanıtının EN SONUNA şu gizli JSON etiketini tek satır halinde ekle (sistem bu veriyi Google E-Tabloya kaydedip 2 adet Word dilekçesini oluşturacak):
-     [KURUL_KAYIT: {"mahallesi":"...","adaNo":"...","parselNo":"...","muellifi":"...","maliki":"...","parselM2":"...","insaatM2":"..."}]
-   - Bilgiler eksikse kullanıcıdan eksik alanları iste, 7 bilgi tamamlanmadan [KURUL_KAYIT: ...] etiketini EKLEME.
-
-2. TARSUS MAHALLE HAVA DURUMU:
+Ayrıca Furkan Bey'in iş süreçleri hakkında şu kurallara uy:
+1. TARSUS MAHALLE HAVA DURUMU:
    - Kullanıcı Tarsus veya mahalleleri (Bahşiş, Beydeğirmeni, Ünlüköy, Boztepe, Gülek, Çamlıyayla vb.) hakkında hava durumu sorarsa yardımcı ol.
-
-3. RANDEVU VE ACİL DURUM YÖNETİMİ:
+2. RANDEVU VE ACİL DURUM YÖNETİMİ:
    - Kullanıcı "randevu" almak veya Furkan Bey ile görüşmek istediğini söylerse: Adını Soyadını ve görüşmek istediği konuyu sor.
-   - Bilgiler tamamlandığında veya acil durum/kurul kaydı oluştuğunda yanıtının EN SONUNA şu etiketi ekle:
+   - Bilgiler tamamlandığında veya acil durum oluştuğunda yanıtının EN SONUNA şu etiketi ekle:
    [BILDIRIM: Kategori | Kısa Özet]
 `;
 
@@ -334,7 +356,6 @@ Ayrıca Furkan Bey'in iş süreçleri hakkında şu kurallara KESİN olarak uy:
         }
     }
 
-    console.error('Tüm modeller başarısız oldu:', errorLogs.join(' | '));
     history.pop();
     return `Şu an yapay zeka servisine bağlanılamadı. Detay: ${errorLogs[0] || 'Bilinmeyen hata'}`;
 }
@@ -400,23 +421,92 @@ async function connectToWhatsApp() {
 
         console.log(`Yeni mesaj [${senderName} - ${realPhone}]: ${text}`);
 
-        if (cleanLower === 'kurul talep oluştur' || cleanLower.includes('kurul talep oluştur')) {
-            const formRequestMsg =
-                `📝 *KEVSKK Kurul Proje Kayıt & Dilekçe Oluşturma*\n\n` +
-                `Başvurunuzun KEVKS kayıt tablosuna işlenmesi ve Tarsus Belediyesi ile Mersin Büyükşehir Belediyesi başvuru dilekçelerinizin otomatik hazırlanması için lütfen aşağıdaki bilgileri doldurup tek mesajda gönderiniz:\n\n` +
-                `MAHALLESİ:\n` +
-                `ADA NO:\n` +
-                `PARSEL NO:\n` +
-                `MÜELLİFİ:\n` +
-                `MALİKİ:\n` +
-                `PARSEL m²:\n` +
-                `İNŞAAT m²:`;
+        // 1. KULLANICI 7 MADDELİK FORMU DOLDURUP GÖNDERDİYSE DOĞRUDAN YAKALA
+        const parsedForm = parseKurulFormText(text);
+        if (parsedForm) {
+            await sock.sendPresenceUpdate('composing', remoteJid);
 
-            await sock.sendMessage(remoteJid, { text: formRequestMsg });
+            // E-Tabloya kaydet
+            const sheetResult = await appendToKevksSheet(parsedForm);
+
+            // 2 Word dilekçesini doldur
+            const docxMime = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+            const tarsusDocBuffer = fillDocxTemplate(TARSUS_DOCX_TEMPLATE, parsedForm);
+            const mersinDocBuffer = fillDocxTemplate(MERSIN_DOCX_TEMPLATE, parsedForm);
+
+            const confirmMsg =
+                `✅ *KEVSKK Kurul Proje Kaydınız Alındı*\n\n` +
+                `• *Mahallesi:* ${parsedForm.mahallesi.toLocaleUpperCase('tr-TR')}\n` +
+                `• *Ada / Parsel:* ${parsedForm.adaNo} / ${parsedForm.parselNo}\n` +
+                `• *Müellifi:* ${parsedForm.muellifi.toLocaleUpperCase('tr-TR')}\n` +
+                `• *Maliki:* ${parsedForm.maliki.toLocaleUpperCase('tr-TR')}\n` +
+                `• *Parsel / İnşaat m²:* ${parsedForm.parselM2} m² / ${parsedForm.insaatM2} m²\n\n` +
+                `📄 Bilgilerinize göre otomatik doldurulan *Tarsus Belediyesi* ve *Mersin Büyükşehir Belediyesi* başvuru dilekçeleriniz ekte gönderilmektedir.`;
+
+            await sock.sendMessage(remoteJid, { text: confirmMsg });
+
+            if (tarsusDocBuffer) {
+                await sock.sendMessage(remoteJid, {
+                    document: tarsusDocBuffer,
+                    fileName: `Tarsus_Belediyesi_KEVSKK_Basvuru_${parsedForm.adaNo}_${parsedForm.parselNo}.docx`,
+                    mimetype: docxMime
+                });
+            }
+
+            if (mersinDocBuffer) {
+                await sock.sendMessage(remoteJid, {
+                    document: mersinDocBuffer,
+                    fileName: `MersinBB_KEVSKK_Basvuru_${parsedForm.adaNo}_${parsedForm.parselNo}.docx`,
+                    mimetype: docxMime
+                });
+            }
+
+            await sock.sendPresenceUpdate('paused', remoteJid);
+
+            // Sana bildirim at
+            if (OWNER_NUMBER.includes('905')) {
+                const ownerAlert =
+                    `🔔 *Yeni KEVSKK Kurul Kaydı*\n\n` +
+                    `👤 *Gönderen:* ${realPhone} (${senderName})\n` +
+                    `📍 *Taşınmaz:* ${parsedForm.mahallesi.toLocaleUpperCase('tr-TR')} Mah. ${parsedForm.adaNo} Ada ${parsedForm.parselNo} Parsel\n` +
+                    `🏗️ *Müellif / Malik:* ${parsedForm.muellifi} / ${parsedForm.maliki}\n` +
+                    `📊 *E-Tablo Durumu:* ${sheetResult.status} ${sheetResult.row ? `(Satır: ${sheetResult.row}, Sıra: ${sheetResult.siraNo})` : ''}`;
+
+                await sock.sendMessage(OWNER_NUMBER, { text: ownerAlert });
+            }
             return;
         }
 
+        // 2. "kurul talep oluştur" YAZILIRSA HAZIR ŞABLONU GÖNDER
+        if (cleanLower === 'kurul talep oluştur' || cleanLower.includes('kurul talep oluştur')) {
+            const templateMsg =
+                `1. Mahalle;\n` +
+                `2. Ada No;\n` +
+                `3. Parsel No;\n` +
+                `4. Müellifi;\n` +
+                `5. Maliki;\n` +
+                `6. Parsel m²;\n` +
+                `7. İnşaat m²;`;
+
+            await sock.sendMessage(remoteJid, { text: templateMsg });
+            return;
+        }
+
+        // 3. "kurul" YAZILIRSA TIKLANABİLİR HAZIR METİN LİNKİ İLE BİLGİLENDİRME VE 2 EKİ GÖNDER
         if (cleanLower === 'kurul') {
+            const prefilledForm =
+                `1. Mahalle; \n` +
+                `2. Ada No; \n` +
+                `3. Parsel No; \n` +
+                `4. Müellifi; \n` +
+                `5. Maliki; \n` +
+                `6. Parsel m²; \n` +
+                `7. İnşaat m²; `;
+
+            // Asistan numarasına tıklanabilir hazır metin linki (veya botun kendi bağlı numarası)
+            const botRawPhone = (sock.user?.id || ASSISTANT_NUMBER).split(':')[0].split('@')[0].replace(/\D/g, '');
+            const clickableLink = `https://wa.me/${botRawPhone}?text=${encodeURIComponent(prefilledForm)}`;
+
             const kurulInfoMsg =
                 `Merhaba, ben Furkan Bey’in yapay zeka asistanıyım.\n\n` +
                 `🏛️ *MBB KEVSKK (Kent Estetiği Kurulu) Bilgilendirme*\n\n` +
@@ -425,7 +515,9 @@ async function connectToWhatsApp() {
                 `- Tarsus (Uzak İlçeler) Alt Kurul Tarihi: 26.11.2026 (Saat 13:00)\n` +
                 `- İlan Reklam Tabela Alt Kurul Tarihi: 25.11.2026 (Saat 15:00)\n` +
                 `- KEVSK Ana Kurul Tarihi: 26.11.2026 (Saat 15:30)\n\n` +
-                `✍️ Dosya Bilgilerini iletmek isterseniz lütfen *kurul talep oluştur* yazınız.\n\n` +
+                `✍️ *Dosya Bilgilerini İletmek ve Otomatik Dilekçe Oluşturmak İçin Tıklayın:*\n` +
+                `👉 ${clickableLink}\n` +
+                `_(Linke tıkladığınızda 7 maddelik form mesaj kutunuza otomatik dolacaktır, yanlarını doldurup göndermeniz yeterlidir.)_\n\n` +
                 `⚠️ *Önemli Teslim Uyarısı:* Belirtilen son teslim tarihi, evrakların Tarsus Belediyesi İmar ve Şehircilik Müdürlüğü'ne teslim edilmesi gereken en son tarihtir. Projelerin oluşabilecek yoğunluğu göz önünde bulundurularak evrakların son teslim tarihinden birkaç gün önce getirilmesi gerekmektedir.\n\n` +
                 `📂 *DOSYALAMA SİSTEMİ (Sırasıyla):*\n` +
                 `1 : Başvuru Dilekçesi\n` +
@@ -449,26 +541,11 @@ async function connectToWhatsApp() {
             return;
         }
 
+        // 4. DİĞER TÜM MESAJLAR İÇİN GEMINI AI SOHBETİ
         await sock.sendPresenceUpdate('composing', remoteJid);
 
         let aiResponse = await askGemini(remoteJid, senderName, realPhone, text);
 
-        // 1. Kurul E-Tablo Kayıt & Otomatik Word Dilekçe Oluşturma Etiketini Yakala
-        const kurulMatch = aiResponse.match(/\[KURUL_KAYIT:\s*(\{[\s\S]*?\})\]/i);
-        let kurulRecordSaved = null;
-
-        if (kurulMatch) {
-            try {
-                const parsedData = JSON.parse(kurulMatch[1]);
-                const sheetResult = await appendToKevksSheet(parsedData);
-                kurulRecordSaved = { ...parsedData, sheetStatus: sheetResult.status, siraNo: sheetResult.siraNo };
-            } catch (e) {
-                console.error('KURUL_KAYIT JSON ayrıştırma hatası:', e.message);
-            }
-            aiResponse = aiResponse.replace(/\[KURUL_KAYIT:\s*\{[\s\S]*?\}\]/gi, '').trim();
-        }
-
-        // 2. Genel Bildirim Etiketini Yakala
         const notificationMatch = aiResponse.match(/\[BILDIRIM:\s*(.*?)\]/i);
         let notificationDetail = null;
 
@@ -478,44 +555,16 @@ async function connectToWhatsApp() {
         }
 
         const isFirstMessage = (chatHistories.get(remoteJid)?.length || 0) <= 2;
-        if (isOutOfOffice() && (isFirstMessage || notificationDetail || kurulRecordSaved)) {
+        if (isOutOfOffice() && (isFirstMessage || notificationDetail)) {
             aiResponse += `\n\n_Not: Şu an mesai saatleri dışındayız. Acil bir durum varsa mesajınızda *ACİL* belirtmeniz yeterlidir._`;
         }
 
         await sock.sendMessage(remoteJid, { text: aiResponse });
         await sock.sendPresenceUpdate('paused', remoteJid);
 
-        // 2 Word (.docx) dilekçesini doldur ve gönder
-        if (kurulRecordSaved) {
-            const docxMime = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
-            const tarsusDocBuffer = fillDocxTemplate(TARSUS_DOCX_TEMPLATE, kurulRecordSaved);
-            const mersinDocBuffer = fillDocxTemplate(MERSIN_DOCX_TEMPLATE, kurulRecordSaved);
-
-            if (tarsusDocBuffer) {
-                await sock.sendMessage(remoteJid, {
-                    document: tarsusDocBuffer,
-                    fileName: `Tarsus_Belediyesi_KEVSKK_Basvuru_${kurulRecordSaved.adaNo}_${kurulRecordSaved.parselNo}.docx`,
-                    mimetype: docxMime
-                });
-            }
-
-            if (mersinDocBuffer) {
-                await sock.sendMessage(remoteJid, {
-                    document: mersinDocBuffer,
-                    fileName: `MersinBB_KEVSKK_Basvuru_${kurulRecordSaved.adaNo}_${kurulRecordSaved.parselNo}.docx`,
-                    mimetype: docxMime
-                });
-            }
-        }
-
-        // 3. Sana Bildirim Gönder
         const isUrgent = cleanLower.includes('acil');
-        if ((notificationDetail || isUrgent || kurulRecordSaved) && OWNER_NUMBER.includes('905')) {
-            let detailText = notificationDetail || 'Acil Mesaj Bildirimi';
-            if (kurulRecordSaved) {
-                detailText = `Yeni KEVKS Kurul Kaydı (${kurulRecordSaved.mahallesi} Mah. Ada:${kurulRecordSaved.adaNo} Parsel:${kurulRecordSaved.parselNo} | Müellif: ${kurulRecordSaved.muellifi}) - E-Tablo: ${kurulRecordSaved.sheetStatus}`;
-            }
-
+        if ((notificationDetail || isUrgent) && OWNER_NUMBER.includes('905')) {
+            const detailText = notificationDetail || 'Acil Mesaj Bildirimi';
             const ownerAlert =
                 `🔔 *Yeni Asistan Bildirimi*\n\n` +
                 `👤 *Gönderen:* ${realPhone} (${senderName})\n` +
