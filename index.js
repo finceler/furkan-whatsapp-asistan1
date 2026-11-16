@@ -21,7 +21,7 @@ const SHEET_WEBHOOK_URL = (process.env.SHEET_WEBHOOK_URL || '').trim();
 const OWNER_NUMBER = '905XXXXXXXXX@s.whatsapp.net'; // KENDİ NUMARANI BURAYA YAZ (Başında + olmadan)
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'furkan123';
 
-// Word Şablon Dosya Adları (GitHub ana dizininde olmalı)
+// Word Şablon Dosya Adları
 const TARSUS_DOCX_TEMPLATE = 'Tarsus_Belediyesi_KEVSKK_Basvuru_Dilekcesi.docx';
 const MERSIN_DOCX_TEMPLATE = 'Mersinbb_KEVSKK_Basvuru_Dilekcesi.docx';
 
@@ -31,7 +31,6 @@ let connectionStatus = 'Bağlantı bekleniyor...';
 const chatHistories = new Map();
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// XML özel karakterlerini güvenli hale getirme
 function escapeXml(str) {
     return String(str || '')
         .replace(/&/g, '&amp;')
@@ -41,7 +40,7 @@ function escapeXml(str) {
         .replace(/'/g, '&apos;');
 }
 
-// Word (.docx) şablonundaki 1, 2, 3, 456 alanlarını doldurup Buffer döndüren fonksiyon
+// Word (.docx) içindeki bölünmüş XML <w:t> etiketlerini dahi yakalayıp 1, 2, 3, 456 alanlarını dolduran kesin çözüm
 function fillDocxTemplate(templateFilename, data) {
     const filePath = path.join(__dirname, templateFilename);
     if (!fs.existsSync(filePath)) {
@@ -53,30 +52,93 @@ function fillDocxTemplate(templateFilename, data) {
     const zip = new PizZip(content);
     let docXml = zip.file('word/document.xml').asText();
 
-    const mahalle = escapeXml((data.mahallesi || '').toLocaleUpperCase('tr-TR'));
-    const ada = escapeXml(data.adaNo || '');
-    const parsel = escapeXml(data.parselNo || '');
-    const malik = escapeXml((data.maliki || '').toLocaleUpperCase('tr-TR'));
+    const mahalle = escapeXml((data.mahallesi || '').toLocaleUpperCase('tr-TR').trim());
+    const ada = escapeXml(String(data.adaNo || '').trim());
+    const parsel = escapeXml(String(data.parselNo || '').trim());
+    const malik = escapeXml((data.maliki || '').toLocaleUpperCase('tr-TR').trim());
 
-    // Word XML içinde metinler bazen <w:t> etiketlerine bölünmüş olabilir;
-    // Hem bitişik hem de XML etiketleri arasına bölünmüş "1 Mahallesi", "2 ada", "3 parsel", "456 adına" kalıplarını yakalar:
-    docXml = docXml
-        .replace(/(ilçesi,\s*(?:<[^>]+>)*)1((?:<[^>]+>)*\s*Mahallesi)/gi, `$1${mahalle}$2`)
-        .replace(/(tapunun\s*(?:<[^>]+>)*)2((?:<[^>]+>)*\s*ada)/gi, `$1${ada}$2`)
-        .replace(/(ada,\s*(?:<[^>]+>)*)3((?:<[^>]+>)*\s*parsel)/gi, `$1${parsel}$2`)
-        .replace(/(numarasında\s*(?:<[^>]+>)*)456((?:<[^>]+>)*\s*adına)/gi, `$1${malik}$2`);
+    // Tüm <w:t ...>...</w:t> düğümlerini çıkar ve karakter bazlı harita oluştur
+    const textNodes = [];
+    const regex = /<w:t(?:\s[^>]*)?>([\s\S]*?)<\/w:t>/g;
+    let match;
+    while ((match = regex.exec(docXml)) !== null) {
+        textNodes.push({
+            fullMatch: match[0],
+            text: match[1],
+            startIndex: match.index,
+            endIndex: match.index + match[0].length
+        });
+    }
 
-    zip.file('word/document.xml', docXml);
+    // Birleştirilmiş düz metin üzerinde konumları bul
+    let combinedText = '';
+    const charMap = []; // Her karakterin hangi textNode ve kaçıncı indexte olduğunu tutar
+    textNodes.forEach((node, nodeIdx) => {
+        for (let i = 0; i < node.text.length; i++) {
+            charMap.push({ nodeIdx, charIdx: i });
+            combinedText += node.text[i];
+        }
+    });
+
+    // Değiştirilecek kalıplar (Sondan başa uygulanacak ki indeksler kaymasın)
+    const patterns = [
+        { regex: /(ilçesi,\s*)1(\s*Mahallesi)/gi, replacement: mahalle },
+        { regex: /(tapunun\s*)2(\s*ada)/gi, replacement: ada },
+        { regex: /(ada,\s*)3(\s*parsel)/gi, replacement: parsel },
+        { regex: /(numarasında\s*)456(\s*adına)/gi, replacement: malik }
+    ];
+
+    const replacements = [];
+    for (const p of patterns) {
+        let m;
+        while ((m = p.regex.exec(combinedText)) !== null) {
+            const targetStart = m.index + m[1].length;
+            const targetEnd = m[0].length - m[2].length + m.index;
+            replacements.push({
+                start: targetStart,
+                end: targetEnd,
+                value: p.replacement
+            });
+        }
+    }
+
+    // İndeks kaymasını önlemek için büyük indeksten küçüğe sırala
+    replacements.sort((a, b) => b.start - a.start);
+
+    // Karakter dizilerini güncelle
+    const nodeChars = textNodes.map((n) => n.text.split(''));
+    for (const rep of replacements) {
+        if (rep.start >= charMap.length) continue;
+        const firstPos = charMap[rep.start];
+        // İlk karaktere yeni değerin tamamını yaz, diğer eski karakterleri boşalt
+        nodeChars[firstPos.nodeIdx][firstPos.charIdx] = rep.value;
+        for (let pos = rep.start + 1; pos < rep.end && pos < charMap.length; pos++) {
+            const p = charMap[pos];
+            nodeChars[p.nodeIdx][p.charIdx] = '';
+        }
+    }
+
+    // Güncellenmiş metinleri XML'e geri yerleştir
+    let rebuiltXml = '';
+    let lastPos = 0;
+    textNodes.forEach((node, idx) => {
+        rebuiltXml += docXml.slice(lastPos, node.startIndex);
+        const openTag = node.fullMatch.slice(0, node.fullMatch.indexOf('>') + 1);
+        rebuiltXml += `${openTag}${nodeChars[idx].join('')}</w:t>`;
+        lastPos = node.endIndex;
+    });
+    rebuiltXml += docXml.slice(lastPos);
+
+    zip.file('word/document.xml', rebuiltXml);
     return zip.generate({ type: 'nodebuffer', compression: 'DEFLATE' });
 }
 
-// Klasördeki kurul takvimi ve başvuru Excel/PDF dosyalarını otomatik bulup gönderen fonksiyon
+// Klasördeki kurul takvimi ve başvuru Excel/PDF dosyalarını gönderen fonksiyon
 async function sendKurulAttachments(sock, remoteJid) {
     try {
         const files = fs.readdirSync(__dirname);
         const attachments = files.filter((file) => {
             const lower = file.toLowerCase();
-            // Şablon dilekçeler hariç, klasördeki .xlsx, .xls ve .pdf dosyalarını al
             return (
                 (lower.endsWith('.xlsx') || lower.endsWith('.xls') || lower.endsWith('.pdf')) &&
                 !lower.includes('package')
@@ -101,7 +163,6 @@ async function sendKurulAttachments(sock, remoteJid) {
     }
 }
 
-// API anahtarının erişebildiği aktif Flash/Pro modellerini otomatik bulan fonksiyon
 async function getAvailableModels() {
     try {
         const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${GEMINI_API_KEY}`);
@@ -125,7 +186,6 @@ async function getAvailableModels() {
     }
 }
 
-// LID veya JID'den gerçek telefon numarasını çözen fonksiyon
 async function resolveRealPhoneNumber(sock, msg) {
     const key = msg.key;
     let candidateJid = key.senderPn || key.remoteJidAlt || key.participant || key.remoteJid || '';
@@ -152,29 +212,33 @@ async function resolveRealPhoneNumber(sock, msg) {
     return digits ? `+${digits}` : 'Bilinmeyen Numara';
 }
 
-// Google E-Tablo'ya (KEVKS -> Sayfa3) yeni kayıt ekleme fonksiyonu
+// Google E-Tablo'ya (KEVKS) yeni kayıt ekleme fonksiyonu
 async function appendToKevksSheet(recordData) {
     if (!SHEET_WEBHOOK_URL) {
-        console.warn('SHEET_WEBHOOK_URL tanımlı değil, e-tabloya yazılamadı.');
-        return { status: 'skipped' };
+        console.error('HATA: Railway Variables içinde SHEET_WEBHOOK_URL tanımlı değil!');
+        return { status: 'SHEET_WEBHOOK_URL_EKSIK' };
     }
 
     try {
         const response = await fetch(SHEET_WEBHOOK_URL, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            redirect: 'follow',
+            headers: { 'Content-Type': 'text/plain;charset=utf-8' },
             body: JSON.stringify(recordData)
         });
-        const result = await response.json();
-        console.log('E-Tablo kayıt sonucu:', result);
-        return result;
+        const rawText = await response.text();
+        console.log('Google Apps Script Ham Yanıt:', rawText);
+        try {
+            return JSON.parse(rawText);
+        } catch {
+            return { status: 'yanit_ayristirilamadi', raw: rawText.slice(0, 100) };
+        }
     } catch (error) {
         console.error('E-Tablo kayıt hatası:', error.message);
         return { status: 'error', message: error.message };
     }
 }
 
-// Mesai saati kontrolü (Türkiye saati UTC+3, Hafta içi 08:30 - 17:30)
 function isOutOfOffice() {
     const now = new Date();
     const trTime = new Date(now.toLocaleString('en-US', { timeZone: 'Europe/Istanbul' }));
@@ -186,7 +250,6 @@ function isOutOfOffice() {
     return false;
 }
 
-// Tek bir Gemini modeline istek atan fonksiyon
 async function callGeminiModel(modelName, systemInstruction, history) {
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${GEMINI_API_KEY}`;
     const response = await fetch(url, {
@@ -214,7 +277,6 @@ async function callGeminiModel(modelName, systemInstruction, history) {
     return text;
 }
 
-// Gemini AI Yanıt Üretici
 async function askGemini(userId, senderName, realPhone, userMessage) {
     if (!GEMINI_API_KEY) {
         return 'Sistem yapılandırması eksik: Railway Variables içinde GEMINI_API_KEY tanımlı değil.';
@@ -233,7 +295,7 @@ Ayrıca Furkan Bey'in iş süreçleri hakkında şu kurallara KESİN olarak uy:
 1. KURUL PROJE KAYIT ETİKETİ (ÇOK ÖNEMLİ):
    - Kullanıcı kurul kayıt tablosu ve başvuru dilekçeleri için gereken 7 proje bilgisini (MAHALLESİ, ADA NO, PARSEL NO, MÜELLİFİ, MALİKİ, PARSEL m², İNŞAAT m²) verdiğinde:
      a) Bilgileri aldığını, KEVKS kurul kayıt tablosuna işlendiğini ve hazırlanan Tarsus Belediyesi ile Mersin Büyükşehir Belediyesi başvuru dilekçelerinin ekte gönderildiğini nazikçe belirt.
-     b) Yanıtının EN SONUNA şu gizli JSON etiketini ekle (sistem bu veriyi Google E-Tabloya kaydedip 2 adet Word dilekçesini oluşturacak):
+     b) Yanıtının EN SONUNA şu gizli JSON etiketini tek satır halinde ekle (sistem bu veriyi Google E-Tabloya kaydedip 2 adet Word dilekçesini oluşturacak):
      [KURUL_KAYIT: {"mahallesi":"...","adaNo":"...","parselNo":"...","muellifi":"...","maliki":"...","parselM2":"...","insaatM2":"..."}]
    - Bilgiler eksikse kullanıcıdan eksik alanları iste, 7 bilgi tamamlanmadan [KURUL_KAYIT: ...] etiketini EKLEME.
 
@@ -338,7 +400,6 @@ async function connectToWhatsApp() {
 
         console.log(`Yeni mesaj [${senderName} - ${realPhone}]: ${text}`);
 
-        // ÖZEL KOMUT 1: "kurul talep oluştur"
         if (cleanLower === 'kurul talep oluştur' || cleanLower.includes('kurul talep oluştur')) {
             const formRequestMsg =
                 `📝 *KEVSKK Kurul Proje Kayıt & Dilekçe Oluşturma*\n\n` +
@@ -355,7 +416,6 @@ async function connectToWhatsApp() {
             return;
         }
 
-        // ÖZEL KOMUT 2: "kurul" (Birebir sabit bilgilendirme metni + 2 adet Excel/PDF eki)
         if (cleanLower === 'kurul') {
             const kurulInfoMsg =
                 `Merhaba, ben Furkan Bey’in yapay zeka asistanıyım.\n\n` +
@@ -389,13 +449,12 @@ async function connectToWhatsApp() {
             return;
         }
 
-        // DİĞER TÜM MESAJLAR İÇİN GEMINI AI SOHBETİ VE KAYIT İŞLEMLERİ
         await sock.sendPresenceUpdate('composing', remoteJid);
 
         let aiResponse = await askGemini(remoteJid, senderName, realPhone, text);
 
         // 1. Kurul E-Tablo Kayıt & Otomatik Word Dilekçe Oluşturma Etiketini Yakala
-        const kurulMatch = aiResponse.match(/\[KURUL_KAYIT:\s*(\{.*?\})\]/i);
+        const kurulMatch = aiResponse.match(/\[KURUL_KAYIT:\s*(\{[\s\S]*?\})\]/i);
         let kurulRecordSaved = null;
 
         if (kurulMatch) {
@@ -406,7 +465,7 @@ async function connectToWhatsApp() {
             } catch (e) {
                 console.error('KURUL_KAYIT JSON ayrıştırma hatası:', e.message);
             }
-            aiResponse = aiResponse.replace(/\[KURUL_KAYIT:\s*\{.*?\}\]/gi, '').trim();
+            aiResponse = aiResponse.replace(/\[KURUL_KAYIT:\s*\{[\s\S]*?\}\]/gi, '').trim();
         }
 
         // 2. Genel Bildirim Etiketini Yakala
@@ -426,7 +485,7 @@ async function connectToWhatsApp() {
         await sock.sendMessage(remoteJid, { text: aiResponse });
         await sock.sendPresenceUpdate('paused', remoteJid);
 
-        // Eğer 7 bilgi tamamlandıysa: Hazırlanan 2 Word (.docx) dilekçesini kullanıcıya gönder
+        // 2 Word (.docx) dilekçesini doldur ve gönder
         if (kurulRecordSaved) {
             const docxMime = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
             const tarsusDocBuffer = fillDocxTemplate(TARSUS_DOCX_TEMPLATE, kurulRecordSaved);
@@ -449,12 +508,12 @@ async function connectToWhatsApp() {
             }
         }
 
-        // 3. Sana Bildirim Gönder (Randevu, Acil veya Yeni Kurul Kaydı)
+        // 3. Sana Bildirim Gönder
         const isUrgent = cleanLower.includes('acil');
         if ((notificationDetail || isUrgent || kurulRecordSaved) && OWNER_NUMBER.includes('905')) {
             let detailText = notificationDetail || 'Acil Mesaj Bildirimi';
             if (kurulRecordSaved) {
-                detailText = `Yeni KEVKS Kurul Kaydı (${kurulRecordSaved.mahallesi} Mah. Ada:${kurulRecordSaved.adaNo} Parsel:${kurulRecordSaved.parselNo} | Müellif: ${kurulRecordSaved.muellifi}) - Tablo: ${kurulRecordSaved.sheetStatus}`;
+                detailText = `Yeni KEVKS Kurul Kaydı (${kurulRecordSaved.mahallesi} Mah. Ada:${kurulRecordSaved.adaNo} Parsel:${kurulRecordSaved.parselNo} | Müellif: ${kurulRecordSaved.muellifi}) - E-Tablo: ${kurulRecordSaved.sheetStatus}`;
             }
 
             const ownerAlert =
