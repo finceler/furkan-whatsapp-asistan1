@@ -15,7 +15,7 @@ const PORT = process.env.PORT || 3000;
 // Çevre Değişkenleri (Railway Variables)
 const GEMINI_API_KEY = (process.env.GEMINI_API_KEY || '').trim();
 const SHEET_WEBHOOK_URL = (process.env.SHEET_WEBHOOK_URL || '').trim();
-const OWNER_NUMBER = '905XXXXXXXXX@s.whatsapp.net'; // KENDİ NUMARANI BURAYA YAZ (Başında + olmadan)
+const OWNER_NUMBER = '9055309455371@s.whatsapp.net'; // KENDİ NUMARANI BURAYA YAZ (Başında + olmadan)
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'furkan123';
 
 let qrCodeData = null;
