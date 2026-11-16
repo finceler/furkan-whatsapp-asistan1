@@ -8,6 +8,9 @@ const { Boom } = require('@hapi/boom');
 const express = require('express');
 const QRCode = require('qrcode');
 const pino = require('pino');
+const fs = require('fs');
+const path = require('path');
+const PizZip = require('pizzip');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -18,11 +21,85 @@ const SHEET_WEBHOOK_URL = (process.env.SHEET_WEBHOOK_URL || '').trim();
 const OWNER_NUMBER = '905XXXXXXXXX@s.whatsapp.net'; // KENDİ NUMARANI BURAYA YAZ (Başında + olmadan)
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'furkan123';
 
+// Word Şablon Dosya Adları (GitHub ana dizininde olmalı)
+const TARSUS_DOCX_TEMPLATE = 'Tarsus_Belediyesi_KEVSKK_Basvuru_Dilekcesi.docx';
+const MERSIN_DOCX_TEMPLATE = 'Mersinbb_KEVSKK_Basvuru_Dilekcesi.docx';
+
 let qrCodeData = null;
 let connectionStatus = 'Bağlantı bekleniyor...';
 
 const chatHistories = new Map();
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// XML özel karakterlerini güvenli hale getirme
+function escapeXml(str) {
+    return String(str || '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&apos;');
+}
+
+// Word (.docx) şablonundaki 1, 2, 3, 456 alanlarını doldurup Buffer döndüren fonksiyon
+function fillDocxTemplate(templateFilename, data) {
+    const filePath = path.join(__dirname, templateFilename);
+    if (!fs.existsSync(filePath)) {
+        console.error(`Şablon dosya bulunamadı: ${templateFilename}`);
+        return null;
+    }
+
+    const content = fs.readFileSync(filePath, 'binary');
+    const zip = new PizZip(content);
+    let docXml = zip.file('word/document.xml').asText();
+
+    const mahalle = escapeXml((data.mahallesi || '').toLocaleUpperCase('tr-TR'));
+    const ada = escapeXml(data.adaNo || '');
+    const parsel = escapeXml(data.parselNo || '');
+    const malik = escapeXml((data.maliki || '').toLocaleUpperCase('tr-TR'));
+
+    // Word XML içinde metinler bazen <w:t> etiketlerine bölünmüş olabilir;
+    // Hem bitişik hem de XML etiketleri arasına bölünmüş "1 Mahallesi", "2 ada", "3 parsel", "456 adına" kalıplarını yakalar:
+    docXml = docXml
+        .replace(/(ilçesi,\s*(?:<[^>]+>)*)1((?:<[^>]+>)*\s*Mahallesi)/gi, `$1${mahalle}$2`)
+        .replace(/(tapunun\s*(?:<[^>]+>)*)2((?:<[^>]+>)*\s*ada)/gi, `$1${ada}$2`)
+        .replace(/(ada,\s*(?:<[^>]+>)*)3((?:<[^>]+>)*\s*parsel)/gi, `$1${parsel}$2`)
+        .replace(/(numarasında\s*(?:<[^>]+>)*)456((?:<[^>]+>)*\s*adına)/gi, `$1${malik}$2`);
+
+    zip.file('word/document.xml', docXml);
+    return zip.generate({ type: 'nodebuffer', compression: 'DEFLATE' });
+}
+
+// Klasördeki kurul takvimi ve başvuru Excel/PDF dosyalarını otomatik bulup gönderen fonksiyon
+async function sendKurulAttachments(sock, remoteJid) {
+    try {
+        const files = fs.readdirSync(__dirname);
+        const attachments = files.filter((file) => {
+            const lower = file.toLowerCase();
+            // Şablon dilekçeler hariç, klasördeki .xlsx, .xls ve .pdf dosyalarını al
+            return (
+                (lower.endsWith('.xlsx') || lower.endsWith('.xls') || lower.endsWith('.pdf')) &&
+                !lower.includes('package')
+            );
+        });
+
+        for (const file of attachments) {
+            const filePath = path.join(__dirname, file);
+            const isExcel = file.toLowerCase().endsWith('.xlsx') || file.toLowerCase().endsWith('.xls');
+            const mimetype = isExcel
+                ? 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+                : 'application/pdf';
+
+            await sock.sendMessage(remoteJid, {
+                document: fs.readFileSync(filePath),
+                fileName: file,
+                mimetype
+            });
+        }
+    } catch (err) {
+        console.error('Kurul ekleri gönderilirken hata:', err.message);
+    }
+}
 
 // API anahtarının erişebildiği aktif Flash/Pro modellerini otomatik bulan fonksiyon
 async function getAvailableModels() {
@@ -37,7 +114,6 @@ async function getAvailableModels() {
             .filter((name) => name.includes('flash') || name.includes('pro'))
             .filter((name) => !name.includes('vision') && !name.includes('image') && !name.includes('tts'));
 
-        // En güncel Flash modellerini öne al
         validModels.sort((a, b) => {
             const score = (n) => (n.includes('flash') ? 10 : 0) + (n.includes('3.') ? 5 : n.includes('2.5') ? 3 : 0);
             return score(b) - score(a);
@@ -45,7 +121,6 @@ async function getAvailableModels() {
 
         return validModels.length > 0 ? validModels : ['gemini-2.5-flash', 'gemini-3.8-flash'];
     } catch (e) {
-        console.error('Model listesi alınamadı:', e.message);
         return ['gemini-2.5-flash', 'gemini-3.8-flash'];
     }
 }
@@ -139,7 +214,7 @@ async function callGeminiModel(modelName, systemInstruction, history) {
     return text;
 }
 
-// Gemini AI Yanıt Üretici (Otomatik model keşfi ve yedekleme ile)
+// Gemini AI Yanıt Üretici
 async function askGemini(userId, senderName, realPhone, userMessage) {
     if (!GEMINI_API_KEY) {
         return 'Sistem yapılandırması eksik: Railway Variables içinde GEMINI_API_KEY tanımlı değil.';
@@ -154,41 +229,18 @@ async function askGemini(userId, senderName, realPhone, userMessage) {
 Sen Furkan İnceler'in (Furkan Bey) profesyonel, kibar, zeki ve doğal konuşan yapay zeka WhatsApp asistanısın.
 Kullanıcılarla tıpkı gerçek bir yapay zeka (Gemini) gibi akıcı, samimi ama saygılı bir dille sohbet et. Genel kültür, teknik konular, günlük sohbet veya merak ettikleri her konuda yardımcı ol.
 
-Ayrıca Furkan Bey'in iş süreçleri hakkında şu bilgilere hakimsin:
-1. KURUMSAL GÖREVLER (Tarsus Belediyesi İmar ve Şehircilik Müdürlüğü & MBB KEVSKK):
-   - Kullanıcı "kurul" veya KEVSKK süreçlerini sorduğunda:
-     a) Mersin Büyükşehir Belediyesi (MBB) Kent Estetiği ve Sürdürülebilir Kent Kurulu (KEVSKK) proje başvuru sürecini ve 12 maddelik evrak kontrol listesini paylaş:
-        1) Başvuru Dilekçesi
-        2) İletişim Bilgileri / Proje Başvuru Formu
-        3) Tapu Belgesi (Güncel)
-        4) İmar Durum Belgesi
-        5) İlçe Belediyesi Üst Yazısı
-        6) Onaylı Mimari Proje
-        7) Peyzaj Projesi
-        8) Arazi Uydu Görüntüsü
-        9) Arazi Resimleri (Güncel saha fotoğrafları)
-        10) 3D Renderlar (Görselleştirmeler)
-        11) Açıklama Raporu
-        12) Proje Kontrol Formu
-     b) HEMEN ARDINDAN kurul kayıt tablosuna işlenebilmesi için kullanıcıdan aşağıdaki 7 bilgiyi şablon halinde iste:
-        *MAHALLESİ:*
-        *ADA NO:*
-        *PARSEL NO:*
-        *MÜELLİFİ:*
-        *MALİKİ:*
-        *PARSEL m²:*
-        *İNŞAAT m²:*
-
-2. KURUL PROJE KAYIT ETİKETİ (ÇOK ÖNEMLİ):
-   - Kullanıcı yukarıdaki 7 proje bilgisini (Mahalle, Ada No, Parsel No, Müellifi, Maliki, Parsel m², İnşaat m²) verdiğinde, bilgileri aldığını ve KEVKS kurul kayıt listesine eklendiğini nazikçe onayla.
-   - Yanıtının EN SONUNA şu gizli JSON etiketini ekle (sistem bu veriyi doğrudan Google E-Tabloya kaydedecek):
-   [KURUL_KAYIT: {"mahallesi":"...","adaNo":"...","parselNo":"...","muellifi":"...","maliki":"...","parselM2":"...","insaatM2":"..."}]
+Ayrıca Furkan Bey'in iş süreçleri hakkında şu kurallara KESİN olarak uy:
+1. KURUL PROJE KAYIT ETİKETİ (ÇOK ÖNEMLİ):
+   - Kullanıcı kurul kayıt tablosu ve başvuru dilekçeleri için gereken 7 proje bilgisini (MAHALLESİ, ADA NO, PARSEL NO, MÜELLİFİ, MALİKİ, PARSEL m², İNŞAAT m²) verdiğinde:
+     a) Bilgileri aldığını, KEVKS kurul kayıt tablosuna işlendiğini ve hazırlanan Tarsus Belediyesi ile Mersin Büyükşehir Belediyesi başvuru dilekçelerinin ekte gönderildiğini nazikçe belirt.
+     b) Yanıtının EN SONUNA şu gizli JSON etiketini ekle (sistem bu veriyi Google E-Tabloya kaydedip 2 adet Word dilekçesini oluşturacak):
+     [KURUL_KAYIT: {"mahallesi":"...","adaNo":"...","parselNo":"...","muellifi":"...","maliki":"...","parselM2":"...","insaatM2":"..."}]
    - Bilgiler eksikse kullanıcıdan eksik alanları iste, 7 bilgi tamamlanmadan [KURUL_KAYIT: ...] etiketini EKLEME.
 
-3. TARSUS MAHALLE HAVA DURUMU:
+2. TARSUS MAHALLE HAVA DURUMU:
    - Kullanıcı Tarsus veya mahalleleri (Bahşiş, Beydeğirmeni, Ünlüköy, Boztepe, Gülek, Çamlıyayla vb.) hakkında hava durumu sorarsa yardımcı ol.
 
-4. RANDEVU VE ACİL DURUM YÖNETİMİ:
+3. RANDEVU VE ACİL DURUM YÖNETİMİ:
    - Kullanıcı "randevu" almak veya Furkan Bey ile görüşmek istediğini söylerse: Adını Soyadını ve görüşmek istediği konuyu sor.
    - Bilgiler tamamlandığında veya acil durum/kurul kaydı oluştuğunda yanıtının EN SONUNA şu etiketi ekle:
    [BILDIRIM: Kategori | Kısa Özet]
@@ -209,14 +261,12 @@ Ayrıca Furkan Bey'in iş süreçleri hakkında şu bilgilere hakimsin:
     for (const modelName of modelsToTry.slice(0, 5)) {
         try {
             const replyText = await callGeminiModel(modelName, systemInstruction, history);
-            console.log(`Başarılı yanıt üretilen model: ${modelName}`);
             history.push({
                 role: 'model',
                 parts: [{ text: replyText }]
             });
             return replyText;
         } catch (err) {
-            console.log(`[${modelName}] başarısız: ${err.message}`);
             errorLogs.push(`${modelName}: ${err.message}`);
             await sleep(800);
         }
@@ -282,16 +332,69 @@ async function connectToWhatsApp() {
 
         if (!text.trim()) return;
 
+        const cleanLower = text.trim().toLocaleLowerCase('tr-TR');
         const senderName = msg.pushName || 'İsimsiz Kullanıcı';
         const realPhone = await resolveRealPhoneNumber(sock, msg);
 
         console.log(`Yeni mesaj [${senderName} - ${realPhone}]: ${text}`);
 
+        // ÖZEL KOMUT 1: "kurul talep oluştur"
+        if (cleanLower === 'kurul talep oluştur' || cleanLower.includes('kurul talep oluştur')) {
+            const formRequestMsg =
+                `📝 *KEVSKK Kurul Proje Kayıt & Dilekçe Oluşturma*\n\n` +
+                `Başvurunuzun KEVKS kayıt tablosuna işlenmesi ve Tarsus Belediyesi ile Mersin Büyükşehir Belediyesi başvuru dilekçelerinizin otomatik hazırlanması için lütfen aşağıdaki bilgileri doldurup tek mesajda gönderiniz:\n\n` +
+                `MAHALLESİ:\n` +
+                `ADA NO:\n` +
+                `PARSEL NO:\n` +
+                `MÜELLİFİ:\n` +
+                `MALİKİ:\n` +
+                `PARSEL m²:\n` +
+                `İNŞAAT m²:`;
+
+            await sock.sendMessage(remoteJid, { text: formRequestMsg });
+            return;
+        }
+
+        // ÖZEL KOMUT 2: "kurul" (Birebir sabit bilgilendirme metni + 2 adet Excel/PDF eki)
+        if (cleanLower === 'kurul') {
+            const kurulInfoMsg =
+                `Merhaba, ben Furkan Bey’in yapay zeka asistanıyım.\n\n` +
+                `🏛️ *MBB KEVSKK (Kent Estetiği Kurulu) Bilgilendirme*\n\n` +
+                `📅 *En Yakın Kurul Bilgisi (21. Kurul):*\n` +
+                `- Son Teslim Tarihi (Tarsus Bld. İmar ve Şehircilik Müd.): 20.11.2026\n` +
+                `- Tarsus (Uzak İlçeler) Alt Kurul Tarihi: 26.11.2026 (Saat 13:00)\n` +
+                `- İlan Reklam Tabela Alt Kurul Tarihi: 25.11.2026 (Saat 15:00)\n` +
+                `- KEVSK Ana Kurul Tarihi: 26.11.2026 (Saat 15:30)\n\n` +
+                `✍️ Dosya Bilgilerini iletmek isterseniz lütfen *kurul talep oluştur* yazınız.\n\n` +
+                `⚠️ *Önemli Teslim Uyarısı:* Belirtilen son teslim tarihi, evrakların Tarsus Belediyesi İmar ve Şehircilik Müdürlüğü'ne teslim edilmesi gereken en son tarihtir. Projelerin oluşabilecek yoğunluğu göz önünde bulundurularak evrakların son teslim tarihinden birkaç gün önce getirilmesi gerekmektedir.\n\n` +
+                `📂 *DOSYALAMA SİSTEMİ (Sırasıyla):*\n` +
+                `1 : Başvuru Dilekçesi\n` +
+                `2 : Başvuran İletişim Bilgileri (Proje Başvuru Formu)\n` +
+                `3 : Tapu Belgesi\n` +
+                `4 : İmar Durum Belgesi\n` +
+                `5 : İlçe Belediyesi Üst Yazısı\n` +
+                `6 : İlçe Belediyesi Onaylı Mimari Proje\n` +
+                `7 : Peyzaj Projesi\n` +
+                `8 : Arazi Uydu Görüntüsü\n` +
+                `9 : Arazi Resimleri\n` +
+                `10 : Renderlar (3D Görsel)\n` +
+                `11 : Açıklama Raporu\n` +
+                `12 : Proje Kontrol Formu (Proje Müellifince doldurulacaktır)\n\n` +
+                `✍️ *Form Doldurma Kuralı:*\n` +
+                `MBB KEVSKK Proje Kontrol ve Başvuru dosyasında Proje Kontrol sayfası mimar tarafından doldurulacaktır. Proje Başvuru kısmında ise Mimar Bilgileri ile Parsel ve Malik Bilgileri yine mimar tarafından doldurulacaktır.\n\n` +
+                `📎 İlgili kurul takvimi ve başvuru/kontrol Excel dosyaları ekte gönderilmektedir.`;
+
+            await sock.sendMessage(remoteJid, { text: kurulInfoMsg });
+            await sendKurulAttachments(sock, remoteJid);
+            return;
+        }
+
+        // DİĞER TÜM MESAJLAR İÇİN GEMINI AI SOHBETİ VE KAYIT İŞLEMLERİ
         await sock.sendPresenceUpdate('composing', remoteJid);
 
         let aiResponse = await askGemini(remoteJid, senderName, realPhone, text);
 
-        // 1. Kurul E-Tablo Kayıt Etiketini Yakala
+        // 1. Kurul E-Tablo Kayıt & Otomatik Word Dilekçe Oluşturma Etiketini Yakala
         const kurulMatch = aiResponse.match(/\[KURUL_KAYIT:\s*(\{.*?\})\]/i);
         let kurulRecordSaved = null;
 
@@ -323,12 +426,35 @@ async function connectToWhatsApp() {
         await sock.sendMessage(remoteJid, { text: aiResponse });
         await sock.sendPresenceUpdate('paused', remoteJid);
 
+        // Eğer 7 bilgi tamamlandıysa: Hazırlanan 2 Word (.docx) dilekçesini kullanıcıya gönder
+        if (kurulRecordSaved) {
+            const docxMime = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+            const tarsusDocBuffer = fillDocxTemplate(TARSUS_DOCX_TEMPLATE, kurulRecordSaved);
+            const mersinDocBuffer = fillDocxTemplate(MERSIN_DOCX_TEMPLATE, kurulRecordSaved);
+
+            if (tarsusDocBuffer) {
+                await sock.sendMessage(remoteJid, {
+                    document: tarsusDocBuffer,
+                    fileName: `Tarsus_Belediyesi_KEVSKK_Basvuru_${kurulRecordSaved.adaNo}_${kurulRecordSaved.parselNo}.docx`,
+                    mimetype: docxMime
+                });
+            }
+
+            if (mersinDocBuffer) {
+                await sock.sendMessage(remoteJid, {
+                    document: mersinDocBuffer,
+                    fileName: `MersinBB_KEVSKK_Basvuru_${kurulRecordSaved.adaNo}_${kurulRecordSaved.parselNo}.docx`,
+                    mimetype: docxMime
+                });
+            }
+        }
+
         // 3. Sana Bildirim Gönder (Randevu, Acil veya Yeni Kurul Kaydı)
-        const isUrgent = text.toLocaleLowerCase('tr-TR').includes('acil');
+        const isUrgent = cleanLower.includes('acil');
         if ((notificationDetail || isUrgent || kurulRecordSaved) && OWNER_NUMBER.includes('905')) {
             let detailText = notificationDetail || 'Acil Mesaj Bildirimi';
             if (kurulRecordSaved) {
-                detailText = `Yeni KEVKS Kurul Kaydı (${kurulRecordSaved.mahallesi} Mah. Ada:${kurulRecordSaved.adaNo} Parsel:${kurulRecordSaved.parselNo}) - Tablo Durumu: ${kurulRecordSaved.sheetStatus}`;
+                detailText = `Yeni KEVKS Kurul Kaydı (${kurulRecordSaved.mahallesi} Mah. Ada:${kurulRecordSaved.adaNo} Parsel:${kurulRecordSaved.parselNo} | Müellif: ${kurulRecordSaved.muellifi}) - Tablo: ${kurulRecordSaved.sheetStatus}`;
             }
 
             const ownerAlert =
