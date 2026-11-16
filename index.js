@@ -14,6 +14,7 @@ const PORT = process.env.PORT || 3000;
 
 // Çevre Değişkenleri (Railway Variables)
 const GEMINI_API_KEY = (process.env.GEMINI_API_KEY || '').trim();
+const SHEET_WEBHOOK_URL = (process.env.SHEET_WEBHOOK_URL || '').trim();
 const OWNER_NUMBER = '905XXXXXXXXX@s.whatsapp.net'; // KENDİ NUMARANI BURAYA YAZ (Başında + olmadan)
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'furkan123';
 
@@ -27,7 +28,6 @@ async function resolveRealPhoneNumber(sock, msg) {
     const key = msg.key;
     let candidateJid = key.senderPn || key.remoteJidAlt || key.participant || key.remoteJid || '';
 
-    // Eğer hala @lid formatındaysa Baileys LID eşleştiricisinden gerçek numarayı sorgula
     if (candidateJid.endsWith('@lid') && sock?.signalRepository?.lidMapping?.getPNForLID) {
         try {
             const mappedPn = await sock.signalRepository.lidMapping.getPNForLID(candidateJid);
@@ -48,6 +48,28 @@ async function resolveRealPhoneNumber(sock, msg) {
         return `Gizli Numara (LID: ${digits})`;
     }
     return digits ? `+${digits}` : 'Bilinmeyen Numara';
+}
+
+// Google E-Tablo'ya (KEVKS -> Sayfa3) yeni kayıt ekleme fonksiyonu
+async function appendToKevksSheet(recordData) {
+    if (!SHEET_WEBHOOK_URL) {
+        console.warn('SHEET_WEBHOOK_URL tanımlı değil, e-tabloya yazılamadı.');
+        return { status: 'skipped' };
+    }
+
+    try {
+        const response = await fetch(SHEET_WEBHOOK_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(recordData)
+        });
+        const result = await response.json();
+        console.log('E-Tablo kayıt sonucu:', result);
+        return result;
+    } catch (error) {
+        console.error('E-Tablo kayıt hatası:', error.message);
+        return { status: 'error', message: error.message };
+    }
 }
 
 // Mesai saati kontrolü (Türkiye saati UTC+3, Hafta içi 08:30 - 17:30)
@@ -73,7 +95,7 @@ async function callGeminiModel(modelName, systemInstruction, history) {
             contents: history,
             generationConfig: {
                 temperature: 0.7,
-                maxOutputTokens: 800
+                maxOutputTokens: 1000
             }
         })
     });
@@ -107,38 +129,42 @@ Kullanıcılarla tıpkı gerçek bir yapay zeka (Gemini) gibi akıcı, samimi am
 
 Ayrıca Furkan Bey'in iş süreçleri hakkında şu bilgilere hakimsin:
 1. KURUMSAL GÖREVLER (Tarsus Belediyesi İmar ve Şehircilik Müdürlüğü & MBB KEVSKK):
-   - Mersin Büyükşehir Belediyesi (MBB) Kent Estetiği ve Sanat Komisyonu (KEVSKK) kurul tarihleri ve proje teslim süreçleri hakkında bilgi verebilirsin.
-   - KEVSKK / Belediye Proje Başvurusu İçin 12 Maddelik Evrak Kontrol Listesi:
-     1) Başvuru Dilekçesi
-     2) İletişim Bilgileri / Proje Başvuru Formu
-     3) Tapu Belgesi (Güncel)
-     4) İmar Durum Belgesi
-     5) İlçe Belediyesi Üst Yazısı
-     6) Onaylı Mimari Proje
-     7) Peyzaj Projesi
-     8) Arazi Uydu Görüntüsü
-     9) Arazi Resimleri (Güncel saha fotoğrafları)
-     10) 3D Renderlar (Görselleştirmeler)
-     11) Açıklama Raporu
-     12) Proje Kontrol Formu
-   Kullanıcı evrakları veya kurulu sorarsa bu süreci ve listeyi düzenli şekilde paylaş.
+   - Kullanıcı "kurul" veya KEVSKK süreçlerini sorduğunda:
+     a) Mersin Büyükşehir Belediyesi (MBB) Kent Estetiği ve Sürdürülebilir Kent Kurulu (KEVSKK) proje başvuru sürecini ve 12 maddelik evrak kontrol listesini paylaş:
+        1) Başvuru Dilekçesi
+        2) İletişim Bilgileri / Proje Başvuru Formu
+        3) Tapu Belgesi (Güncel)
+        4) İmar Durum Belgesi
+        5) İlçe Belediyesi Üst Yazısı
+        6) Onaylı Mimari Proje
+        7) Peyzaj Projesi
+        8) Arazi Uydu Görüntüsü
+        9) Arazi Resimleri (Güncel saha fotoğrafları)
+        10) 3D Renderlar (Görselleştirmeler)
+        11) Açıklama Raporu
+        12) Proje Kontrol Formu
+     b) HEMEN ARDINDAN kurul kayıt tablosuna işlenebilmesi için kullanıcıdan aşağıdaki 7 bilgiyi şablon halinde iste:
+        *MAHALLESİ:*
+        *ADA NO:*
+        *PARSEL NO:*
+        *MÜELLİFİ:*
+        *MALİKİ:*
+        *PARSEL m²:*
+        *İNŞAAT m²:*
 
-2. TARSUS MAHALLE HAVA DURUMU:
-   - Kullanıcı Tarsus veya mahalleleri (Bahşiş, Beydeğirmeni, Ünlüköy, Boztepe, Gülek, Çamlıyayla vb.) hakkında hava durumu sorarsa kendi genel meteorolojik bilgin ve güncel mevsim koşullarına göre yardımcı ol.
+2. KURUL PROJE KAYIT ETİKETİ (ÇOK ÖNEMLİ):
+   - Kullanıcı yukarıdaki 7 proje bilgisini (Mahalle, Ada No, Parsel No, Müellifi, Maliki, Parsel m², İnşaat m²) verdiğinde, bilgileri aldığını ve KEVKS kurul kayıt listesine eklendiğini nazikçe onayla.
+   - Yanıtının EN SONUNA şu gizli JSON etiketini ekle (sistem bu veriyi doğrudan Google E-Tabloya kaydedecek):
+   [KURUL_KAYIT: {"mahallesi":"...","adaNo":"...","parselNo":"...","muellifi":"...","maliki":"...","parselM2":"...","insaatM2":"..."}]
+   - Bilgiler eksikse kullanıcıdan eksik alanları iste, 7 bilgi tamamlanmadan [KURUL_KAYIT: ...] etiketini EKLEME.
 
-3. RANDEVU VE ACİL DURUM YÖNETİMİ:
-   - Kullanıcı "randevu" almak veya Furkan Bey ile görüşmek istediğini söylerse: Eğer henüz Ad-Soyad ve Görüşme Konusunu yazmadıysa, nazikçe Adını Soyadını ve görüşmek istediği konuyu sor.
-   - Kullanıcı Ad-Soyad ve Konu bilgisini verdiğinde randevu talebinin alındığını onayla.
+3. TARSUS MAHALLE HAVA DURUMU:
+   - Kullanıcı Tarsus veya mahalleleri (Bahşiş, Beydeğirmeni, Ünlüköy, Boztepe, Gülek, Çamlıyayla vb.) hakkında hava durumu sorarsa yardımcı ol.
 
-4. BİLDİRİM TETİKLEYİCİ (ÇOK ÖNEMLİ):
-   - Eğer mesajda:
-     a) Kullanıcı randevu için Ad-Soyad ve konu bilgisini tamamladıysa,
-     b) Mesajda "ACİL" veya çok acil bir durum varsa,
-     c) Önemli bir belediye/proje evrak teslimi talebi iletildiyse,
-   Yanıtının EN SONUNA şu gizli etiketi ekle:
+4. RANDEVU VE ACİL DURUM YÖNETİMİ:
+   - Kullanıcı "randevu" almak veya Furkan Bey ile görüşmek istediğini söylerse: Adını Soyadını ve görüşmek istediği konuyu sor.
+   - Bilgiler tamamlandığında veya acil durum/kurul kaydı oluştuğunda yanıtının EN SONUNA şu etiketi ekle:
    [BILDIRIM: Kategori | Kısa Özet]
-   Örnek: [BILDIRIM: Randevu Talebi | Ahmet Yılmaz - İmar durumu ve mimari proje görüşmesi]
-   Sadece normal sohbet ediliyorsa veya kullanıcı henüz randevu detaylarını vermediyse bu etiketi EKLEME.
 `;
 
     history.push({
@@ -146,12 +172,11 @@ Ayrıca Furkan Bey'in iş süreçleri hakkında şu bilgilere hakimsin:
         parts: [{ text: `Gönderen Adı: ${senderName} (${realPhone})\nMesaj: ${userMessage}` }]
     });
 
-    if (history.length > 10) {
-        history.splice(0, history.length - 10);
+    if (history.length > 12) {
+        history.splice(0, history.length - 12);
     }
 
     try {
-        // Önce gemini-2.5-flash dene, hata verirse gemini-2.0-flash'a geç
         let replyText;
         try {
             replyText = await callGeminiModel('gemini-2.5-flash', systemInstruction, history);
@@ -168,7 +193,6 @@ Ayrıca Furkan Bey'in iş süreçleri hakkında şu bilgilere hakimsin:
         return replyText;
     } catch (error) {
         console.error('Gemini API Kesin Hata:', error.message);
-        // Hatalı kullanıcı mesajını geçmişten çıkar ki sonraki mesajları bozmasın
         history.pop();
         return `Şu an yapay zeka servisinde geçici bir sorun var (${error.message}). Lütfen biraz sonra tekrar deneyin.`;
     }
@@ -238,6 +262,22 @@ async function connectToWhatsApp() {
 
         let aiResponse = await askGemini(remoteJid, senderName, realPhone, text);
 
+        // 1. Kurul E-Tablo Kayıt Etiketini Yakala
+        const kurulMatch = aiResponse.match(/\[KURUL_KAYIT:\s*(\{.*?\})\]/i);
+        let kurulRecordSaved = null;
+
+        if (kurulMatch) {
+            try {
+                const parsedData = JSON.parse(kurulMatch[1]);
+                const sheetResult = await appendToKevksSheet(parsedData);
+                kurulRecordSaved = { ...parsedData, sheetStatus: sheetResult.status, siraNo: sheetResult.siraNo };
+            } catch (e) {
+                console.error('KURUL_KAYIT JSON ayrıştırma hatası:', e.message);
+            }
+            aiResponse = aiResponse.replace(/\[KURUL_KAYIT:\s*\{.*?\}\]/gi, '').trim();
+        }
+
+        // 2. Genel Bildirim Etiketini Yakala
         const notificationMatch = aiResponse.match(/\[BILDIRIM:\s*(.*?)\]/i);
         let notificationDetail = null;
 
@@ -247,16 +287,21 @@ async function connectToWhatsApp() {
         }
 
         const isFirstMessage = (chatHistories.get(remoteJid)?.length || 0) <= 2;
-        if (isOutOfOffice() && (isFirstMessage || notificationDetail)) {
+        if (isOutOfOffice() && (isFirstMessage || notificationDetail || kurulRecordSaved)) {
             aiResponse += `\n\n_Not: Şu an mesai saatleri dışındayız. Acil bir durum varsa mesajınızda *ACİL* belirtmeniz yeterlidir._`;
         }
 
         await sock.sendMessage(remoteJid, { text: aiResponse });
         await sock.sendPresenceUpdate('paused', remoteJid);
 
+        // 3. Sana Bildirim Gönder (Randevu, Acil veya Yeni Kurul Kaydı)
         const isUrgent = text.toLocaleLowerCase('tr-TR').includes('acil');
-        if ((notificationDetail || isUrgent) && OWNER_NUMBER.includes('905')) {
-            const detailText = notificationDetail || 'Acil Mesaj Bildirimi';
+        if ((notificationDetail || isUrgent || kurulRecordSaved) && OWNER_NUMBER.includes('905')) {
+            let detailText = notificationDetail || 'Acil Mesaj Bildirimi';
+            if (kurulRecordSaved) {
+                detailText = `Yeni KEVKS Kurul Kaydı (${kurulRecordSaved.mahallesi} Mah. Ada:${kurulRecordSaved.adaNo} Parsel:${kurulRecordSaved.parselNo}) - Tablo Durumu: ${kurulRecordSaved.sheetStatus}`;
+            }
+
             const ownerAlert =
                 `🔔 *Yeni Asistan Bildirimi*\n\n` +
                 `👤 *Gönderen:* ${realPhone} (${senderName})\n` +
