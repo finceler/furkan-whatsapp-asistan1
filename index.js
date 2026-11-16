@@ -4,15 +4,12 @@ const QRCode = require('qrcode');
 const pino = require('pino');
 const fs = require('fs');
 const path = require('path');
-const crypto = require('crypto');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 // Geriye dönük uyumluluk: eski Railway değişkeni GEMINI_API_KEY geçiş süresince desteklenir.
 const GROQ_API_KEY = process.env.GROQ_API_KEY || process.env.GEMINI_API_KEY;
 const GROQ_MODEL = process.env.GROQ_MODEL || '';
-const ADMIN_USERNAME = process.env.ADMIN_USERNAME || 'furkan';
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
 // Varsayılan yol mevcut kurulumla aynı tutulur; Volume geçişi ayrıca ve kontrollü yapılır.
 const BAILEYS_AUTH_DIR = process.env.BAILEYS_AUTH_DIR || path.join(__dirname, 'auth_info_baileys');
 // Furkan Bey'in ana WhatsApp numarası (Sabit olarak 905309455371 tanımlı)
@@ -514,34 +511,6 @@ async function askGemini(history, customSystemPrompt = null) {
   return data.choices?.[0]?.message?.content || 'Şu an yanıt oluşturulamadı, notunuzu ileteceğim.';
 }
 
-function safeEqual(a, b) {
-  const left = Buffer.from(String(a));
-  const right = Buffer.from(String(b));
-  return left.length === right.length && crypto.timingSafeEqual(left, right);
-}
-
-function requireAdmin(req, res, next) {
-  if (!ADMIN_PASSWORD) {
-    return res.status(503).send('QR yönetim erişimi kapalı. Railway ortam değişkenlerine ADMIN_PASSWORD ekleyin.');
-  }
-  const header = req.headers.authorization || '';
-  const [scheme, encoded] = header.split(' ');
-  if (scheme !== 'Basic' || !encoded) {
-    res.set('WWW-Authenticate', 'Basic realm="Furkan Asistan Yönetimi"');
-    return res.status(401).send('Yönetici girişi gerekli.');
-  }
-  let decoded = '';
-  try { decoded = Buffer.from(encoded, 'base64').toString('utf8'); } catch {}
-  const separator = decoded.indexOf(':');
-  const username = separator >= 0 ? decoded.slice(0, separator) : '';
-  const password = separator >= 0 ? decoded.slice(separator + 1) : '';
-  if (!safeEqual(username, ADMIN_USERNAME) || !safeEqual(password, ADMIN_PASSWORD)) {
-    res.set('WWW-Authenticate', 'Basic realm="Furkan Asistan Yönetimi"');
-    return res.status(401).send('Kullanıcı adı veya parola hatalı.');
-  }
-  next();
-}
-
 function isDuplicateMessage(msg) {
   const id = msg.key?.id;
   if (!id) return false;
@@ -571,11 +540,15 @@ app.get('/health', (req, res) => {
   res.status(200).json({ status: 'ok', whatsapp: isConnected ? 'connected' : 'disconnected' });
 });
 
-app.get('/', requireAdmin, async (req, res) => {
-  if (isConnected) return res.send('<h2>✅ Furkan Asistan WhatsApp bağlantısı aktif.</h2>');
-  if (!latestQR) return res.send('<h2>⏳ QR kod oluşturuluyor. Birkaç saniye sonra yenileyin.</h2>');
+app.get('/', async (req, res) => {
+  if (isConnected) {
+    return res.send('<div style="text-align:center;font-family:sans-serif;margin-top:50px;"><h2>✅ Furkan Asistan WhatsApp bağlantısı aktif.</h2></div>');
+  }
+  if (!latestQR) {
+    return res.send('<div style="text-align:center;font-family:sans-serif;margin-top:50px;"><meta http-equiv="refresh" content="3"><h2>⏳ QR kod oluşturuluyor. Lütfen bekleyin...</h2></div>');
+  }
   const qrImage = await QRCode.toDataURL(latestQR);
-  res.send(`<div style="text-align:center;font-family:sans-serif;margin-top:50px;"><h2>WhatsApp Business → Bağlı Cihazlar → Cihaz Bağla</h2><img src="${qrImage}" style="width:300px;height:300px"/><p>Bağlandıktan sonra sayfayı yenileyin.</p></div>`);
+  res.send(`<div style="text-align:center;font-family:sans-serif;margin-top:50px;"><meta http-equiv="refresh" content="15"><h2>WhatsApp Business → Bağlı Cihazlar → Cihaz Bağla</h2><img src="${qrImage}" style="width:300px;height:300px"/><p>QR kodu telefonunuzdan okutun. Sayfa otomatik yenilenir.</p></div>`);
 });
 
 async function startBot() {
@@ -775,6 +748,5 @@ app.listen(PORT, () => {
   if (!process.env.BAILEYS_AUTH_DIR) {
     console.warn('UYARI: Baileys oturumu mevcut varsayılan dizinde. Railway Volume geçişi henüz yapılmadı; bu değişiklik mevcut oturumu korumak için bilinçli olarak ertelendi.');
   }
-  if (!ADMIN_PASSWORD) console.warn('UYARI: ADMIN_PASSWORD tanımlı değil; QR yönetim sayfası güvenlik nedeniyle kapalı.');
   startBot().catch(err => console.error('İlk WhatsApp başlatma hatası:', err));
 });
