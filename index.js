@@ -41,7 +41,7 @@ function escapeXml(str) {
         .replace(/'/g, '&apos;');
 }
 
-// Kullanıcının gönderdiği 7 maddelik formu doğrudan kod ile ayrıştıran fonksiyon (AI'ya bağlı kalmaz)
+// Kullanıcının gönderdiği 7 maddelik formu doğrudan kod ile ayrıştıran fonksiyon
 function parseKurulFormText(text) {
     const lines = text.split(/\r?\n/);
     const result = {
@@ -71,7 +71,6 @@ function parseKurulFormText(text) {
         else if (lower.includes('inşaat') || lower.includes('insaat')) result.insaatM2 = val;
     }
 
-    // En az Mahalle, Ada ve Parsel doldurulmuşsa geçerli bir form girişidir
     if (result.mahallesi && result.adaNo && result.parselNo) {
         return result;
     }
@@ -426,10 +425,8 @@ async function connectToWhatsApp() {
         if (parsedForm) {
             await sock.sendPresenceUpdate('composing', remoteJid);
 
-            // E-Tabloya kaydet
             const sheetResult = await appendToKevksSheet(parsedForm);
 
-            // 2 Word dilekçesini doldur
             const docxMime = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
             const tarsusDocBuffer = fillDocxTemplate(TARSUS_DOCX_TEMPLATE, parsedForm);
             const mersinDocBuffer = fillDocxTemplate(MERSIN_DOCX_TEMPLATE, parsedForm);
@@ -463,7 +460,6 @@ async function connectToWhatsApp() {
 
             await sock.sendPresenceUpdate('paused', remoteJid);
 
-            // Sana bildirim at
             if (OWNER_NUMBER.includes('905')) {
                 const ownerAlert =
                     `🔔 *Yeni KEVSKK Kurul Kaydı*\n\n` +
@@ -492,7 +488,7 @@ async function connectToWhatsApp() {
             return;
         }
 
-        // 3. "kurul" YAZILIRSA TIKLANABİLİR HAZIR METİN LİNKİ İLE BİLGİLENDİRME VE 2 EKİ GÖNDER
+        // 3. "kurul" YAZILIRSA GÜNCEL KURUL TARİHLERİ + TIKLANABİLİR LİNK + 2 EKİ GÖNDER
         if (cleanLower === 'kurul') {
             const prefilledForm =
                 `1. Mahalle; \n` +
@@ -503,7 +499,6 @@ async function connectToWhatsApp() {
                 `6. Parsel m²; \n` +
                 `7. İnşaat m²; `;
 
-            // Asistan numarasına tıklanabilir hazır metin linki (veya botun kendi bağlı numarası)
             const botRawPhone = (sock.user?.id || ASSISTANT_NUMBER).split(':')[0].split('@')[0].replace(/\D/g, '');
             const clickableLink = `https://wa.me/${botRawPhone}?text=${encodeURIComponent(prefilledForm)}`;
 
@@ -511,10 +506,9 @@ async function connectToWhatsApp() {
                 `Merhaba, ben Furkan Bey’in yapay zeka asistanıyım.\n\n` +
                 `🏛️ *MBB KEVSKK (Kent Estetiği Kurulu) Bilgilendirme*\n\n` +
                 `📅 *En Yakın Kurul Bilgisi (21. Kurul):*\n` +
-                `- Son Teslim Tarihi (Tarsus Bld. İmar ve Şehircilik Müd.): 20.11.2026\n` +
-                `- Tarsus (Uzak İlçeler) Alt Kurul Tarihi: 26.11.2026 (Saat 13:00)\n` +
-                `- İlan Reklam Tabela Alt Kurul Tarihi: 25.11.2026 (Saat 15:00)\n` +
-                `- KEVSK Ana Kurul Tarihi: 26.11.2026 (Saat 15:30)\n\n` +
+                `- Son Teslim Tarihi (Tarsus Bld. İmar ve Şehircilik Müd.): 20.11.2026\n\n` +
+                `📅 *Bir Sonraki Kurul Bilgisi (22. Kurul):*\n` +
+                `- Son Teslim Tarihi (Tarsus Bld. İmar ve Şehircilik Müd.): 04.12.2026\n\n` +
                 `✍️ *Dosya Bilgilerini İletmek ve Otomatik Dilekçe Oluşturmak İçin Tıklayın:*\n` +
                 `👉 ${clickableLink}\n` +
                 `_(Linke tıkladığınızda 7 maddelik form mesaj kutunuza otomatik dolacaktır, yanlarını doldurup göndermeniz yeterlidir.)_\n\n` +
