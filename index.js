@@ -15,7 +15,7 @@ const PORT = process.env.PORT || 3000;
 // Çevre Değişkenleri (Railway Variables)
 const GEMINI_API_KEY = (process.env.GEMINI_API_KEY || '').trim();
 const SHEET_WEBHOOK_URL = (process.env.SHEET_WEBHOOK_URL || '').trim();
-const OWNER_NUMBER = '9055309455371@s.whatsapp.net'; // KENDİ NUMARANI BURAYA YAZ (Başında + olmadan)
+const OWNER_NUMBER = '905XXXXXXXXX@s.whatsapp.net'; // KENDİ NUMARANI BURAYA YAZ (Başında + olmadan)
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'furkan123';
 
 let qrCodeData = null;
@@ -177,13 +177,8 @@ Ayrıca Furkan Bey'in iş süreçleri hakkında şu bilgilere hakimsin:
     }
 
     try {
-        let replyText;
-        try {
-            replyText = await callGeminiModel('gemini-2.5-flash', systemInstruction, history);
-        } catch (primaryErr) {
-            console.log('gemini-2.5-flash hatası, gemini-2.0-flash deneniyor:', primaryErr.message);
-            replyText = await callGeminiModel('gemini-2.0-flash', systemInstruction, history);
-        }
+        // Güncel gemini-3.8-flash modelini kullan
+        const replyText = await callGeminiModel('gemini-3.8-flash', systemInstruction, history);
 
         history.push({
             role: 'model',
