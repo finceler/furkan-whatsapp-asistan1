@@ -18,20 +18,37 @@ const SHEET_WEBHOOK_URL = (process.env.SHEET_WEBHOOK_URL || '').trim();
 const OWNER_NUMBER = '905XXXXXXXXX@s.whatsapp.net'; // KENDİ NUMARANI BURAYA YAZ (Başında + olmadan)
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'furkan123';
 
-// Yoğunluk durumunda sırayla denenecek aktif modeller
-const FALLBACK_MODELS = [
-    'gemini-2.5-flash',
-    'gemini-3.8-flash',
-    'gemini-2.5-flash-lite'
-];
-
 let qrCodeData = null;
 let connectionStatus = 'Bağlantı bekleniyor...';
 
 const chatHistories = new Map();
-
-// Bekleme fonksiyonu
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// API anahtarının erişebildiği aktif Flash/Pro modellerini otomatik bulan fonksiyon
+async function getAvailableModels() {
+    try {
+        const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${GEMINI_API_KEY}`);
+        const data = await res.json();
+        if (!data.models) return ['gemini-2.5-flash', 'gemini-3.8-flash'];
+
+        const validModels = data.models
+            .filter((m) => m.supportedGenerationMethods?.includes('generateContent'))
+            .map((m) => m.name.replace('models/', ''))
+            .filter((name) => name.includes('flash') || name.includes('pro'))
+            .filter((name) => !name.includes('vision') && !name.includes('image') && !name.includes('tts'));
+
+        // En güncel Flash modellerini öne al
+        validModels.sort((a, b) => {
+            const score = (n) => (n.includes('flash') ? 10 : 0) + (n.includes('3.') ? 5 : n.includes('2.5') ? 3 : 0);
+            return score(b) - score(a);
+        });
+
+        return validModels.length > 0 ? validModels : ['gemini-2.5-flash', 'gemini-3.8-flash'];
+    } catch (e) {
+        console.error('Model listesi alınamadı:', e.message);
+        return ['gemini-2.5-flash', 'gemini-3.8-flash'];
+    }
+}
 
 // LID veya JID'den gerçek telefon numarasını çözen fonksiyon
 async function resolveRealPhoneNumber(sock, msg) {
@@ -122,7 +139,7 @@ async function callGeminiModel(modelName, systemInstruction, history) {
     return text;
 }
 
-// Gemini AI Yanıt Üretici (Otomatik yedekli model zinciri ile)
+// Gemini AI Yanıt Üretici (Otomatik model keşfi ve yedekleme ile)
 async function askGemini(userId, senderName, realPhone, userMessage) {
     if (!GEMINI_API_KEY) {
         return 'Sistem yapılandırması eksik: Railway Variables içinde GEMINI_API_KEY tanımlı değil.';
@@ -186,27 +203,28 @@ Ayrıca Furkan Bey'in iş süreçleri hakkında şu bilgilere hakimsin:
         history.splice(0, history.length - 12);
     }
 
-    let lastError = null;
+    const modelsToTry = await getAvailableModels();
+    let errorLogs = [];
 
-    // Listedeki modelleri sırayla dene; biri yoğun ise diğerine geç
-    for (const modelName of FALLBACK_MODELS) {
+    for (const modelName of modelsToTry.slice(0, 5)) {
         try {
             const replyText = await callGeminiModel(modelName, systemInstruction, history);
+            console.log(`Başarılı yanıt üretilen model: ${modelName}`);
             history.push({
                 role: 'model',
                 parts: [{ text: replyText }]
             });
             return replyText;
         } catch (err) {
-            lastError = err;
-            console.log(`[${modelName}] başarısız (${err.message}), sonraki modele geçiliyor...`);
-            await sleep(1200);
+            console.log(`[${modelName}] başarısız: ${err.message}`);
+            errorLogs.push(`${modelName}: ${err.message}`);
+            await sleep(800);
         }
     }
 
-    console.error('Tüm Gemini modelleri yoğun/hatalı:', lastError?.message);
+    console.error('Tüm modeller başarısız oldu:', errorLogs.join(' | '));
     history.pop();
-    return 'Şu an yapay zeka sunucularında anlık bir yoğunluk var, lütfen birkaç saniye sonra mesajınızı tekrar gönderin.';
+    return `Şu an yapay zeka servisine bağlanılamadı. Detay: ${errorLogs[0] || 'Bilinmeyen hata'}`;
 }
 
 async function connectToWhatsApp() {
